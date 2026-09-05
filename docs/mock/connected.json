@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "updated_at": "2026-09-05T10:22:31+10:00",
+  "daemon": {
+    "version": "0.1.0",
+    "source": "aap"
+  },
+  "device": {
+    "address": "AC:DE:48:00:11:22",
+    "name": "AirPods",
+    "model_id": "201B",
+    "model": "AirPods 4 (ANC)",
+    "firmware": "7B21",
+    "serial": "H4XKJ2LMN0P1",
+    "connected": true,
+    "aap_link": true
+  },
+  "battery": {
+    "stale": false,
+    "left": {
+      "level": 87,
+      "charging": false,
+      "present": true
+    },
+    "right": {
+      "level": 85,
+      "charging": false,
+      "present": true
+    },
+    "case": {
+      "level": 62,
+      "charging": true,
+      "present": true
+    }
+  },
+  "ear": {
+    "left": "in",
+    "right": "in"
+  },
+  "lid": "open",
+  "noise_control": "anc",
+  "conversational_awareness": true,
+  "adaptive_level": 45
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=AirPods AAP daemon
+Documentation=https://github.com/z89/aurisd
+After=bluetooth.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aurisd
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=aurisd=info
+RuntimeDirectory=aurisd
+RuntimeDirectoryMode=0700
+CacheDirectory=aurisd
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target
