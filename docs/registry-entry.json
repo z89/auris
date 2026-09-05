@@ -1,0 +1,21 @@
+{
+  "id": "auris",
+  "name": "Auris",
+  "capabilities": [
+    "dankbar-widget",
+    "control-center"
+  ],
+  "category": "system",
+  "repo": "https://github.com/z89/auris",
+  "author": "z89",
+  "description": "airpods for dankmaterialshell. battery for each bud and the case, ear detection, noise control, on a pill that shows up when they connect.",
+  "dependencies": [
+    "aurisd"
+  ],
+  "compositors": [
+    "any"
+  ],
+  "distro": [
+    "arch"
+  ]
+}

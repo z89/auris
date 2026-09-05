@@ -1,0 +1,25 @@
+{
+    "id": "auris",
+    "name": "Auris",
+    "description": "airpods for dankmaterialshell. battery for each bud and the case, ear detection, noise control, on a pill that shows up when they connect.",
+    "version": "0.1.0",
+    "author": "z89",
+    "type": "widget",
+    "capabilities": [
+        "dankbar-widget",
+        "control-center"
+    ],
+    "component": "./AurisWidget.qml",
+    "settings": "./AurisSettings.qml",
+    "startupCheck": "./AurisStartupCheck.qml",
+    "icon": "headphones",
+    "requires_dms": ">=0.1.0",
+    "dependencies": [
+        "aurisd"
+    ],
+    "permissions": [
+        "settings_read",
+        "settings_write",
+        "process"
+    ]
+}

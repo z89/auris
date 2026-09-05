@@ -1,0 +1,49 @@
+[package]
+name = "aurisd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "airpods battery and controls for linux, over aap"
+license = "MIT"
+repository = "https://github.com/z89/auris"
+readme = "README.md"
+keywords = ["airpods", "bluetooth", "aap", "bluez"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "aurisd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurisd"
+path = "src/bin/aurisd.rs"
+
+[[bin]]
+name = "auris"
+path = "src/bin/auris.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+toml = "0.8"
+dirs = "5"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[dependencies.tokio]
+version = "1"
+features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "fs"]
+
+[dependencies.bluer]
+version = "0.17"
+default-features = false
+features = ["bluetoothd", "l2cap", "id"]
+
+[profile.release]
+strip = true

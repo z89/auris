@@ -1,0 +1,20 @@
+pkgbase = aurisd-git
+	pkgdesc = airpods battery and controls for linux, over aap. daemon and cli
+	pkgver = r1.0000000
+	pkgrel = 1
+	url = https://github.com/z89/auris
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = git
+	makedepends = cargo
+	depends = gcc-libs
+	depends = glibc
+	depends = dbus
+	depends = bluez
+	provides = aurisd
+	conflicts = aurisd
+	source = aurisd-git::git+https://github.com/z89/auris.git
+	sha256sums = SKIP
+
+pkgname = aurisd-git

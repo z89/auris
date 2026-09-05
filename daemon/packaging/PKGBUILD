@@ -1,0 +1,46 @@
+# Maintainer: z89 <30657227+z89@users.noreply.github.com>
+pkgname=aurisd-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="airpods battery and controls for linux, over aap. daemon and cli"
+arch=('x86_64' 'aarch64')
+url="https://github.com/z89/auris"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'dbus' 'bluez')
+makedepends=('git' 'cargo')
+provides=('aurisd')
+conflicts=('aurisd')
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$pkgname/daemon"
+	printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+	cd "$pkgname/daemon"
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "$pkgname/daemon"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release --all-features
+}
+
+check() {
+	cd "$pkgname/daemon"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo test --frozen --release
+}
+
+package() {
+	cd "$pkgname/daemon"
+	install -Dm755 "target/release/aurisd" "$pkgdir/usr/bin/aurisd"
+	install -Dm755 "target/release/auris" "$pkgdir/usr/bin/auris"
+	install -Dm644 "dist/aurisd.service" "$pkgdir/usr/lib/systemd/user/aurisd.service"
+	install -Dm644 "../LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
