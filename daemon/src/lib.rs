@@ -6,16 +6,19 @@
 //! `ctl.sock` as line-delimited JSON. Both formats are frozen in
 //! `docs/plans/CONTRACT.md`.
 //!
-//! The daemon never initiates a Bluetooth connection: it only reacts to
-//! BlueZ's `Connected` property.
+//! Automatic AAP attempts require a fresh local BlueZ connection check and
+//! stop after ambiguous link loss. Explicit connection requests may transfer
+//! audio; local Bluetooth state cannot prove ownership by another host.
 
 pub mod aap;
+pub mod ble;
 pub mod bluez;
 pub mod cache;
 pub mod config;
 pub mod ctl_proto;
 pub mod ctl_server;
 pub mod models;
+pub mod settings;
 pub mod state;
 pub mod store;
 pub mod writer;

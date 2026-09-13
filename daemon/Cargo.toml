@@ -32,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+aes = "0.8"
 toml = "0.8"
 dirs = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

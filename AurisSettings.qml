@@ -34,7 +34,7 @@ PluginSettings {
     SelectionSetting {
         settingKey: "pillValue"
         label: "Bar value"
-        description: "Which battery the pill reports"
+        description: "Which battery the pill reports. Charging or in-case buds are excluded; charging details stay in the panel."
         options: [
             {
                 "label": "Lowest bud",
@@ -87,22 +87,5 @@ PluginSettings {
         label: "Hide when disconnected"
         description: "Drop the pill from the bar while the AirPods are not connected; it reappears on its own when they connect"
         defaultValue: true
-    }
-
-    ToggleSetting {
-        settingKey: "popupOnConnect"
-        label: "Show stats when AirPods connect"
-        description: "Open the battery popout for a few seconds each time the AirPods connect"
-        defaultValue: true
-    }
-
-    SliderSetting {
-        settingKey: "popupSeconds"
-        label: "Popup duration"
-        description: "How long the connect popout stays open"
-        defaultValue: 6
-        minimum: 2
-        maximum: 20
-        unit: "s"
     }
 }

@@ -6,6 +6,9 @@
 //! [`Packet::Unknown`] and are never an error.
 
 use super::opcode as op;
+use crate::settings::{
+    validate_name, CallControls, HoldDuration, MicrophoneMode, PressSpeed, SettingCommand,
+};
 use crate::state::{EarState, NoiseControlMode};
 
 /// The only way decoding can fail: the packet is shorter than its own contents
@@ -73,7 +76,7 @@ pub struct Metadata {
 }
 
 /// A control value echoed back by the accessory (opcode 0x0009).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlState {
     /// Noise control mode.
     NoiseControl(NoiseControlMode),
@@ -81,6 +84,8 @@ pub enum ControlState {
     ConversationalAwareness(bool),
     /// Adaptive transparency level 0-100.
     AdaptiveLevel(u8),
+    /// A typed setting confirmed by the accessory.
+    Setting(SettingCommand),
     /// A control identifier this version does not model.
     Other {
         /// Control identifier byte.
@@ -164,7 +169,7 @@ pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
             if payload.len() < 2 {
                 return Err(DecodeError::Truncated);
             }
-            Ok(Packet::Control(decode_control(payload[0], payload[1])))
+            decode_control(payload).map(Packet::Control)
         }
         op::OP_METADATA => Ok(Packet::Metadata(decode_metadata(payload))),
         op::OP_FEATURES_ACK => Ok(Packet::FeaturesAck),
@@ -185,16 +190,94 @@ pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
     }
 }
 
-fn decode_control(id: u8, value: u8) -> ControlState {
+fn decode_control(payload: &[u8]) -> Result<ControlState, DecodeError> {
+    let id = payload[0];
+    let value = payload[1];
+    let typed_setting = matches!(
+        id,
+        op::CTL_MICROPHONE
+            | op::CTL_PRESS_SPEED
+            | op::CTL_HOLD_DURATION
+            | op::CTL_LISTENING_MODE_CYCLE
+            | op::CTL_CALL_CONTROLS
+            | op::CTL_PERSONALIZED_VOLUME
+    );
+    if typed_setting && payload.len() < 5 {
+        return Err(DecodeError::Truncated);
+    }
+    if typed_setting && payload.len() != 5 {
+        return Ok(ControlState::Other { id, value });
+    }
+    let scalar_padding_is_zero = !typed_setting || payload[2..5] == [0x00; 3];
     match id {
         op::CTL_NOISE_CONTROL => match NoiseControlMode::from_wire(value) {
-            Some(m) => ControlState::NoiseControl(m),
-            None => ControlState::Other { id, value },
+            Some(m) => Ok(ControlState::NoiseControl(m)),
+            None => Ok(ControlState::Other { id, value }),
         },
-        op::CTL_CONV_AWARENESS => ControlState::ConversationalAwareness(value == 0x01),
-        op::CTL_ADAPTIVE_LEVEL => ControlState::AdaptiveLevel(value.min(100)),
-        _ => ControlState::Other { id, value },
+        op::CTL_CONV_AWARENESS => Ok(ControlState::ConversationalAwareness(value == 0x01)),
+        op::CTL_ADAPTIVE_LEVEL => Ok(ControlState::AdaptiveLevel(value.min(100))),
+        op::CTL_MICROPHONE if scalar_padding_is_zero => Ok(match value {
+            0x00 => ControlState::Setting(SettingCommand::Microphone(MicrophoneMode::Auto)),
+            0x01 => ControlState::Setting(SettingCommand::Microphone(MicrophoneMode::Right)),
+            0x02 => ControlState::Setting(SettingCommand::Microphone(MicrophoneMode::Left)),
+            _ => ControlState::Other { id, value },
+        }),
+        op::CTL_PRESS_SPEED if scalar_padding_is_zero => Ok(match value {
+            0x00 => ControlState::Setting(SettingCommand::PressSpeed(PressSpeed::Default)),
+            0x01 => ControlState::Setting(SettingCommand::PressSpeed(PressSpeed::Slower)),
+            0x02 => ControlState::Setting(SettingCommand::PressSpeed(PressSpeed::Slowest)),
+            _ => ControlState::Other { id, value },
+        }),
+        op::CTL_HOLD_DURATION if scalar_padding_is_zero => Ok(match value {
+            0x00 => ControlState::Setting(SettingCommand::HoldDuration(HoldDuration::Default)),
+            0x01 => ControlState::Setting(SettingCommand::HoldDuration(HoldDuration::Shorter)),
+            0x02 => ControlState::Setting(SettingCommand::HoldDuration(HoldDuration::Shortest)),
+            _ => ControlState::Other { id, value },
+        }),
+        op::CTL_LISTENING_MODE_CYCLE if scalar_padding_is_zero => {
+            let modes = listening_modes_from_mask(value);
+            let setting = SettingCommand::ListeningModeCycle(modes);
+            // A report describes firmware state, not a proposed write. In
+            // particular, keep a single-bit report even though our command
+            // API requires at least two modes for a useful stem cycle.
+            if value != 0 && value & !0x0f == 0 {
+                Ok(ControlState::Setting(setting))
+            } else {
+                Ok(ControlState::Other { id, value })
+            }
+        }
+        op::CTL_CALL_CONTROLS => {
+            // Unlike scalar controls this setting uses two meaningful bytes,
+            // followed by the two zero padding bytes of the fixed frame.
+            Ok(match &payload[1..5] {
+                [0x00, 0x03, 0x00, 0x00] => ControlState::Setting(SettingCommand::CallControls(
+                    CallControls::MuteOnceHangupTwice,
+                )),
+                [0x00, 0x02, 0x00, 0x00] => ControlState::Setting(SettingCommand::CallControls(
+                    CallControls::HangupOnceMuteTwice,
+                )),
+                _ => ControlState::Other { id, value },
+            })
+        }
+        op::CTL_PERSONALIZED_VOLUME if scalar_padding_is_zero => Ok(match value {
+            0x01 => ControlState::Setting(SettingCommand::PersonalizedVolume(true)),
+            0x02 => ControlState::Setting(SettingCommand::PersonalizedVolume(false)),
+            _ => ControlState::Other { id, value },
+        }),
+        _ => Ok(ControlState::Other { id, value }),
     }
+}
+
+fn listening_modes_from_mask(mask: u8) -> Vec<NoiseControlMode> {
+    [
+        (0x01, NoiseControlMode::Off),
+        (0x02, NoiseControlMode::Anc),
+        (0x04, NoiseControlMode::Transparency),
+        (0x08, NoiseControlMode::Adaptive),
+    ]
+    .into_iter()
+    .filter_map(|(bit, mode)| (mask & bit != 0).then_some(mode))
+    .collect()
 }
 
 fn decode_battery(payload: &[u8]) -> Result<Vec<BatteryEntry>, DecodeError> {
@@ -298,14 +381,19 @@ pub fn encode_request_notifications_alt() -> Vec<u8> {
     op::REQUEST_NOTIFICATIONS_ALT.to_vec()
 }
 
-fn encode_control(id: u8, value: u8) -> Vec<u8> {
+fn encode_control_data(id: u8, data: &[u8]) -> Vec<u8> {
+    debug_assert!(data.len() <= 4);
     let mut v = Vec::with_capacity(11);
     v.extend_from_slice(&op::PREFIX);
     v.extend_from_slice(&op::OP_CONTROL.to_le_bytes());
     v.push(id);
-    v.push(value);
-    v.extend_from_slice(&[0x00, 0x00, 0x00]);
+    v.extend_from_slice(data);
+    v.resize(11, 0x00);
     v
+}
+
+fn encode_control(id: u8, value: u8) -> Vec<u8> {
+    encode_control_data(id, &[value])
 }
 
 /// Set the noise control mode.
@@ -321,6 +409,72 @@ pub fn encode_set_conversational_awareness(on: bool) -> Vec<u8> {
 /// Set the adaptive transparency level; the value is clamped to 0-100.
 pub fn encode_set_adaptive_level(level: u8) -> Vec<u8> {
     encode_control(op::CTL_ADAPTIVE_LEVEL, level.min(100))
+}
+
+/// Encode one typed setting as a fixed-width control command.
+pub fn encode_set_setting(setting: &SettingCommand) -> Result<Vec<u8>, String> {
+    setting.validate()?;
+    let packet = match setting {
+        SettingCommand::Microphone(mode) => encode_control(
+            op::CTL_MICROPHONE,
+            match mode {
+                MicrophoneMode::Auto => 0x00,
+                MicrophoneMode::Right => 0x01,
+                MicrophoneMode::Left => 0x02,
+            },
+        ),
+        SettingCommand::PressSpeed(speed) => encode_control(
+            op::CTL_PRESS_SPEED,
+            match speed {
+                PressSpeed::Default => 0x00,
+                PressSpeed::Slower => 0x01,
+                PressSpeed::Slowest => 0x02,
+            },
+        ),
+        SettingCommand::HoldDuration(duration) => encode_control(
+            op::CTL_HOLD_DURATION,
+            match duration {
+                HoldDuration::Default => 0x00,
+                HoldDuration::Shorter => 0x01,
+                HoldDuration::Shortest => 0x02,
+            },
+        ),
+        SettingCommand::ListeningModeCycle(modes) => {
+            let mask = modes.iter().fold(0, |mask, mode| {
+                mask | match mode {
+                    NoiseControlMode::Off => 0x01,
+                    NoiseControlMode::Anc => 0x02,
+                    NoiseControlMode::Transparency => 0x04,
+                    NoiseControlMode::Adaptive => 0x08,
+                }
+            });
+            encode_control(op::CTL_LISTENING_MODE_CYCLE, mask)
+        }
+        SettingCommand::CallControls(controls) => encode_control_data(
+            op::CTL_CALL_CONTROLS,
+            match controls {
+                CallControls::MuteOnceHangupTwice => &[0x00, 0x03],
+                CallControls::HangupOnceMuteTwice => &[0x00, 0x02],
+            },
+        ),
+        SettingCommand::PersonalizedVolume(on) => {
+            encode_control(op::CTL_PERSONALIZED_VOLUME, if *on { 0x01 } else { 0x02 })
+        }
+    };
+    Ok(packet)
+}
+
+/// Encode a rename request. Success only means the packet was accepted for
+/// sending; the name remains unconfirmed until later metadata arrives.
+pub fn encode_rename(name: &str) -> Result<Vec<u8>, String> {
+    validate_name(name)?;
+    let bytes = name.as_bytes();
+    let mut packet = Vec::with_capacity(9 + bytes.len());
+    packet.extend_from_slice(&op::PREFIX);
+    packet.extend_from_slice(&op::OP_RENAME.to_le_bytes());
+    packet.extend_from_slice(&[0x01, bytes.len() as u8, 0x00]);
+    packet.extend_from_slice(bytes);
+    Ok(packet)
 }
 
 #[cfg(test)]
@@ -630,5 +784,124 @@ mod tests {
             decode(&[0x04, 0x00, 0x04, 0x00, 0x2c, 0x00]).unwrap(),
             Packet::Unknown { opcode: 0x002c, .. }
         ));
+    }
+
+    #[test]
+    fn typed_setting_packets_match_the_wire_contract_and_round_trip() {
+        let cases = [
+            (
+                SettingCommand::Microphone(MicrophoneMode::Auto),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x01, 0x00, 0, 0, 0],
+            ),
+            (
+                SettingCommand::Microphone(MicrophoneMode::Right),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x01, 0x01, 0, 0, 0],
+            ),
+            (
+                SettingCommand::Microphone(MicrophoneMode::Left),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x01, 0x02, 0, 0, 0],
+            ),
+            (
+                SettingCommand::PressSpeed(PressSpeed::Default),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x17, 0x00, 0, 0, 0],
+            ),
+            (
+                SettingCommand::PressSpeed(PressSpeed::Slower),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x17, 0x01, 0, 0, 0],
+            ),
+            (
+                SettingCommand::PressSpeed(PressSpeed::Slowest),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x17, 0x02, 0, 0, 0],
+            ),
+            (
+                SettingCommand::HoldDuration(HoldDuration::Default),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x18, 0x00, 0, 0, 0],
+            ),
+            (
+                SettingCommand::HoldDuration(HoldDuration::Shorter),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x18, 0x01, 0, 0, 0],
+            ),
+            (
+                SettingCommand::HoldDuration(HoldDuration::Shortest),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x18, 0x02, 0, 0, 0],
+            ),
+            (
+                SettingCommand::ListeningModeCycle(vec![
+                    NoiseControlMode::Off,
+                    NoiseControlMode::Anc,
+                    NoiseControlMode::Transparency,
+                    NoiseControlMode::Adaptive,
+                ]),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x1a, 0x0f, 0, 0, 0],
+            ),
+            (
+                SettingCommand::CallControls(CallControls::MuteOnceHangupTwice),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x24, 0x00, 0x03, 0, 0],
+            ),
+            (
+                SettingCommand::CallControls(CallControls::HangupOnceMuteTwice),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x24, 0x00, 0x02, 0, 0],
+            ),
+            (
+                SettingCommand::PersonalizedVolume(true),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x26, 0x01, 0, 0, 0],
+            ),
+            (
+                SettingCommand::PersonalizedVolume(false),
+                vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x26, 0x02, 0, 0, 0],
+            ),
+        ];
+
+        for (setting, bytes) in cases {
+            assert_eq!(encode_set_setting(&setting).unwrap(), bytes);
+            assert_eq!(
+                decode(&bytes).unwrap(),
+                Packet::Control(ControlState::Setting(setting))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_setting_echoes_never_become_confirmed_settings() {
+        let short_call = [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x24, 0x00, 0x03];
+        assert_eq!(decode(&short_call), Err(DecodeError::Truncated));
+
+        for bytes in [
+            [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x24, 0x00, 0x03, 1, 0],
+            [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x01, 0x00, 1, 0, 0],
+            [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x1a, 0x10, 0, 0, 0],
+            [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x26, 0x00, 0, 0, 0],
+        ] {
+            assert!(matches!(
+                decode(&bytes).unwrap(),
+                Packet::Control(ControlState::Other { .. })
+            ));
+        }
+
+        let short_scalar = [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x17, 0x01];
+        assert_eq!(decode(&short_scalar), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn rename_packet_uses_utf8_byte_length() {
+        assert_eq!(
+            encode_rename("Auré").unwrap(),
+            vec![
+                0x04, 0x00, 0x04, 0x00, 0x1a, 0x00, 0x01, 0x05, 0x00, b'A', b'u', b'r', 0xc3, 0xa9,
+            ]
+        );
+        assert!(encode_rename("bad\nname").is_err());
+        assert!(encode_rename(&"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn single_mode_report_is_preserved_but_not_accepted_as_a_write() {
+        let report = [4, 0, 4, 0, 9, 0, 0x1a, 2, 0, 0, 0];
+        let setting = SettingCommand::ListeningModeCycle(vec![NoiseControlMode::Anc]);
+        assert_eq!(
+            decode(&report).unwrap(),
+            Packet::Control(ControlState::Setting(setting.clone()))
+        );
+        assert!(encode_set_setting(&setting).is_err());
     }
 }

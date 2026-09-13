@@ -15,12 +15,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot, Semaphore},
+    time::{timeout_at, Instant},
 };
 use tracing::{debug, warn};
 
 use crate::{
     ctl_proto::{Request, Response},
-    store::Store,
+    store::{ConnectionContext, Store},
 };
 
 /// Longest request line accepted. Real requests are well under 200 bytes;
@@ -32,6 +33,10 @@ const MAX_CLIENTS: usize = 16;
 /// Pause after a transient accept error, so a descriptor shortage does not
 /// turn into a busy loop.
 const ACCEPT_RETRY: Duration = Duration::from_millis(200);
+/// Leave a little room below the CLI's five-second I/O timeout. Commands that
+/// sat behind a dial this long must become inert, not run after the client has
+/// already given up or the selected device changed.
+const COMMAND_DEADLINE: Duration = Duration::from_secs(4);
 
 /// A request plus the channel its answer must go back on.
 #[derive(Debug)]
@@ -40,6 +45,11 @@ pub struct Command {
     pub request: Request,
     /// Where the answer goes.
     pub reply: oneshot::Sender<Response>,
+    /// Identity/link context captured before queueing.
+    pub context: ConnectionContext,
+    /// Queue and execution deadline. Dropping `reply` at this point makes a
+    /// later queued command observable as inert to the supervisor.
+    pub deadline: Instant,
 }
 
 /// Bind the control socket, clearing a stale one left by a crash.
@@ -206,7 +216,8 @@ pub async fn handle(stream: UnixStream, store: Arc<Store>, tx: mpsc::Sender<Comm
         }
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Status) => Response::Status(Box::new(store.snapshot())),
-            Ok(request) => dispatch(&tx, request).await,
+            Ok(Request::Subscribe) => return stream_snapshots(write, &store).await,
+            Ok(request) => dispatch(&tx, &store, request).await,
             Err(e) => Response::error(format!("bad request: {e}")),
         };
         let mut body = match serde_json::to_vec(&response) {
@@ -225,18 +236,165 @@ pub async fn handle(stream: UnixStream, store: Arc<Store>, tx: mpsc::Sender<Comm
     }
 }
 
-async fn dispatch(tx: &mpsc::Sender<Command>, request: Request) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if tx.send(Command { request, reply }).await.is_err() {
-        return Response::error("daemon is shutting down");
+/// Write the current snapshot, then one per change until the client hangs up.
+///
+/// `watch` keeps only the newest value, so a slow reader is never a memory
+/// problem: it just skips the states it was too late for and gets the current
+/// one. The connection stops reading requests, so a subscriber that also wants
+/// to send commands opens a second one.
+async fn stream_snapshots(mut write: tokio::net::unix::OwnedWriteHalf, store: &Arc<Store>) {
+    let mut rx = store.subscribe();
+    loop {
+        // borrow_and_update marks this value seen, so the changed() below waits
+        // for the next one instead of returning immediately.
+        let snapshot = rx.borrow_and_update().clone();
+        let mut body = match serde_json::to_vec(&Response::Status(Box::new(snapshot))) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "could not encode snapshot for subscriber");
+                return;
+            }
+        };
+        body.push(b'\n');
+        if let Err(e) = write.write_all(&body).await {
+            debug!(error = %e, "subscriber write failed");
+            return;
+        }
+        if write.flush().await.is_err() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            // The store is gone, which only happens as the daemon shuts down.
+            return;
+        }
     }
-    match rx.await {
-        Ok(r) => r,
-        Err(_) => Response::error("daemon dropped the request"),
+}
+
+async fn dispatch(tx: &mpsc::Sender<Command>, store: &Store, request: Request) -> Response {
+    let deadline = Instant::now() + COMMAND_DEADLINE;
+    dispatch_until(tx, store, request, deadline).await
+}
+
+async fn dispatch_until(
+    tx: &mpsc::Sender<Command>,
+    store: &Store,
+    request: Request,
+    deadline: Instant,
+) -> Response {
+    let (reply, rx) = oneshot::channel();
+    let command = Command {
+        request,
+        reply,
+        context: store.connection_context(),
+        deadline,
+    };
+    match timeout_at(deadline, tx.send(command)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Response::error("daemon is shutting down"),
+        Err(_) => return Response::error("request expired before queueing"),
+    }
+    match timeout_at(deadline, rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Response::error("daemon dropped the request"),
+        Err(_) => Response::error(
+            "request timed out; an already-sent operation may still complete; no automatic retry",
+        ),
     }
 }
 
 /// Path helper used by both binaries.
 pub fn default_socket(runtime_dir: &Path) -> PathBuf {
     crate::config::socket_path(runtime_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::PrimaryBud, state::Snapshot, store::Update};
+
+    /// A socket path under the test temp dir, unique per call.
+    fn temp_socket() -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("aurisd-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ctl.sock")
+    }
+
+    /// Bind, serve, and hand back the path plus the store driving it.
+    fn serving() -> (PathBuf, Arc<Store>) {
+        let path = temp_socket();
+        let listener = bind(&path).unwrap();
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (tx, _rx) = mpsc::channel(4);
+        tokio::spawn(serve(listener, Arc::clone(&store), tx));
+        (path, store)
+    }
+
+    #[tokio::test]
+    async fn subscribe_sends_the_snapshot_then_one_per_change() {
+        let (path, store) = serving();
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        write.write_all(b"{\"cmd\":\"subscribe\"}\n").await.unwrap();
+
+        let first: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["schema"], 1, "first line must be the snapshot");
+        assert_eq!(first["device"]["connected"], false);
+
+        store.apply(Update::AclConnected(true));
+        let second: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            second["device"]["connected"], true,
+            "a change must be pushed without being asked for"
+        );
+
+        // A no-op update must not produce a line; the next real one must.
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::AapLink(true));
+        let third: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(third["device"]["aap_link"], true);
+
+        unbind(&path);
+    }
+
+    #[tokio::test]
+    async fn status_still_answers_one_line_per_request() {
+        let (path, _store) = serving();
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        for _ in 0..2 {
+            write.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(v["schema"], 1);
+        }
+
+        unbind(&path);
+    }
+
+    #[tokio::test]
+    async fn dispatch_deadline_drops_a_queued_reply_receiver() {
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (tx, mut rx) = mpsc::channel(1);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let task = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { dispatch_until(&tx, &store, Request::Reconnect, deadline).await }
+        });
+        let command = rx.recv().await.expect("dispatch queued command");
+        let response = task.await.unwrap();
+        assert!(matches!(response, Response::Ack { ok: false, .. }));
+        assert!(
+            command.reply.is_closed(),
+            "expired dispatch must make the queued command inert"
+        );
+    }
 }

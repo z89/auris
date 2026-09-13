@@ -24,6 +24,8 @@ pub const OP_EAR_DETECTION: u16 = 0x0006;
 pub const OP_CONTROL: u16 = 0x0009;
 /// Subscribe to notifications (host -> accessory).
 pub const OP_REQUEST_NOTIFICATIONS: u16 = 0x000F;
+/// Rename the accessory (host -> accessory).
+pub const OP_RENAME: u16 = 0x001A;
 /// Device metadata: NUL-separated strings. The accessory pushes this
 /// unsolicited after the handshake; it cannot be requested.
 pub const OP_METADATA: u16 = 0x001D;
@@ -46,6 +48,18 @@ pub const CTL_NOISE_CONTROL: u8 = 0x0D;
 pub const CTL_CONV_AWARENESS: u8 = 0x28;
 /// Adaptive transparency level: 0-100.
 pub const CTL_ADAPTIVE_LEVEL: u8 = 0x2E;
+/// Microphone selection: automatic, right, or left.
+pub const CTL_MICROPHONE: u8 = 0x01;
+/// Delay accepted between stem presses.
+pub const CTL_PRESS_SPEED: u8 = 0x17;
+/// Duration required for a stem press-and-hold.
+pub const CTL_HOLD_DURATION: u8 = 0x18;
+/// Bitmask of listening modes included in the press-and-hold cycle.
+pub const CTL_LISTENING_MODE_CYCLE: u8 = 0x1A;
+/// Two-byte mute/hang-up stem assignment used during calls.
+pub const CTL_CALL_CONTROLS: u8 = 0x24;
+/// Personalized Volume on/off.
+pub const CTL_PERSONALIZED_VOLUME: u8 = 0x26;
 
 // ---------------------------------------------------------------------------
 // Static packets

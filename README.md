@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/auris.svg" width="112" alt="auris">
-</p>
-
 <h1 align="center">auris</h1>
 
 <p align="center">airpods for <a href="https://github.com/AvengeMedia/DankMaterialShell">dankmaterialshell</a></p>
@@ -13,7 +9,7 @@
   <img src="https://img.shields.io/badge/dms-1.6%2B-8fd3ff?style=flat-square&labelColor=1b1a20" alt="dms 1.6+">
 </p>
 
-a pair of headphones on the bar, a small panel, and it all shows up on its own when the airpods connect.
+a pair of airpods on the bar, a small panel, and it all shows up on its own when the airpods connect.
 
 two halves in one repo: the plugin at the top, and `aurisd` under [daemon](daemon), the bit that actually talks to the airpods. no root, no patched bluez, no pretending to be a mac.
 
@@ -39,18 +35,61 @@ and drop `auris` onto a bar under settings, bar, widgets. no restart needed.
 
 ## use
 
-the pill keeps out of the way until the airpods connect. then it shows the lower of the two buds, and the panel opens for a few seconds so you can see the lot.
+the pill keeps out of the way until the airpods connect, then appears immediately
+with the buds outside the case. charging buds are excluded from the bar icon and
+bud percentage; charging bolts and green charging colours appear only in the
+panel. the panel only opens when you click it.
 
 left click the pill for the panel. right click flips between anc and transparency.
 
 - **left, right, case**, a bar and a number each. a bud that is out of your ear dims
-- **noise control**: off, anc, transparency, adaptive. adaptive gets a slider
+- **noise control**: off, anc, transparency, adaptive. the ambient-sound adjustment appears when adaptive is selected
 - **conversational awareness**, on or off
-- **reconnect**, when the link is down
+- **setup and device information**, behind the bottom chevron
 
 there is a control center tile too.
 
-the case only reports while the buds sit in it. once they are out, its last level stays on the panel, dimmed, with how long ago it was seen. open the lid once and you have a number that sticks. the bar never shows an old number, only the panel does.
+the compact listening controls stay at the top, outside the scrolling areas.
+open the bottom chevron for device renaming, microphone selection,
+press speed, hold duration, the listening-mode cycle, call-control mapping and
+personalized volume for AirPods 4 (ANC), followed by connection and firmware
+information. setup uses short rows with clickable info icons for explanations;
+it scrolls within the available space without moving the quick controls.
+the panel measures its button labels to choose a comfortable width, bounded by
+the screen. narrower screens wrap button groups into more rows. expanding setup
+reveals content vertically on DMS's stable-height surface; it does not resize the
+panel width or scale its controls. info icons use one click-controlled tooltip.
+these new controls require the matching
+updated daemon and CLI. device reports have verified changes to press speed,
+hold duration, call controls and personalized volume; physical effects still
+need manual verification. rename, microphone selection and listening-mode
+cycling remain unconfirmed on the target firmware. a sent command is not confirmation:
+reported values remain separate from requested selections. valid setting clicks
+send immediately, with per-setting feedback and bottom overlay toasts that do
+not move the layout. a missing echo is labelled unconfirmed, not a failed write.
+the stem cycle needs at least two modes; when its state is unknown, choose two
+to establish a new set. subsequent valid changes send without an Apply button.
+
+when a bud or case stops reporting, the panel retains its last battery and charging
+state. a small bolt sits beside the percentage; historical charging stays muted
+green with “last seen charging … ago”, never presented as a live measurement.
+charging is mentioned only when reported; other captions retain location or
+last-seen time without redundant charge-state wording. an
+empty-case annotation requires a current zero-percent case reading.
+
+there is no fixed Apple case-sleep timeout encoded in auris: AAP absence comes
+from the AirPods' reports. optional identity-matched BLE battery observation can
+fill gaps without reconnecting audio; its own freshness expiry is configurable.
+it requires private keys and is disabled until explicitly configured. see
+[battery and handoff safety](docs/BATTERY_AND_HANDOFF.md) for setup and limitations.
+old charging history already discarded by previous versions cannot be recovered.
+the bar never uses historical charging or battery readings.
+
+the technical dropdown's **reconnect control link** action reopens only auris's
+settings/telemetry link while Bluetooth is connected. it does not reconnect
+Bluetooth audio or pair the AirPods. automatic AAP recovery stops after ambiguous
+link loss so it cannot repeatedly redial during a handoff. the dropdown grows within the available
+screen space and leaves hardware identifiers such as serial/MAC addresses out.
 
 ## settings
 
@@ -59,8 +98,9 @@ under settings, plugins, auris.
 - **show percent** on the pill
 - **pill shows** buds, all, left, right or case
 - **low** and **critical** thresholds for the colour
-- **hide when disconnected**, on by default
-- **show stats when airpods connect** and for how long
+- **hide when disconnected**, on by default. the widget leaves the bar when the
+  airpods go away and comes back the moment they connect, off a push from the
+  daemon rather than a poll
 
 ## needs
 
@@ -82,7 +122,12 @@ the state file is plain json, so anything else can read it too. the [daemon read
 
 ## notes
 
-the plugin has no bluetooth code of its own. it watches the state file and runs the `auris` cli for the buttons, so `auris status` in a terminal and the panel always agree.
+the plugin has no bluetooth code of its own. it subscribes to the daemon's control
+socket for immediate updates, keeps the state file as a fallback, and runs the
+`auris` cli for buttons. `auris status` and the panel therefore use the same state.
+
+for a feature-by-feature comparison with LibrePods, including the deliberately
+narrower parts of auris, see [feature comparison](docs/FEATURE_COMPARISON.md).
 
 pill says the daemon is missing? `systemctl --user status aurisd`. it looks in `~/.local/bin` as well as `PATH`, so a cargo install works too.
 
