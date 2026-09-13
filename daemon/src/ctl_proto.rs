@@ -4,7 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{NoiseControlMode, Snapshot};
+use crate::{
+    settings::SettingCommand,
+    state::{NoiseControlMode, Snapshot},
+};
 
 /// A request from `auris` to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,10 +28,32 @@ pub enum Request {
         /// 0-100.
         value: u8,
     },
+    /// Send one AirPods 4 (ANC) setting. Success means sent, not confirmed.
+    SetSetting {
+        /// Typed key and value, flattened beside `cmd` on the wire.
+        #[serde(flatten)]
+        setting: SettingCommand,
+    },
+    /// Rename AirPods 4 (ANC). Metadata must confirm the new name later.
+    Rename {
+        /// Exact UTF-8 name to send.
+        name: String,
+    },
     /// `{"cmd":"reconnect"}`
     Reconnect,
+    /// `{"cmd":"connect_once"}` — ask BlueZ once to connect the configured
+    /// pinned, paired device. This can transfer audio and never retries.
+    ConnectOnce,
     /// `{"cmd":"status"}` — the reply is the state.json object itself.
     Status,
+    /// `{"cmd":"subscribe"}` — the current snapshot, then one more every time
+    /// anything changes, until the client goes away. No further requests are
+    /// read on the connection once it is streaming.
+    ///
+    /// This exists so a UI does not have to poll `state.json`. The file is
+    /// replaced by rename, which a file watcher does not reliably follow, so
+    /// the alternative is a timer that is both late and always running.
+    Subscribe,
 }
 
 /// A reply from the daemon. `status` answers with the snapshot; everything
@@ -69,10 +94,11 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::MicrophoneMode;
 
     #[test]
     fn requests_match_the_contract_wire_form() {
-        let cases: [(Request, &str); 5] = [
+        let cases = [
             (
                 Request::SetNoiseControl {
                     value: NoiseControlMode::Anc,
@@ -87,8 +113,22 @@ mod tests {
                 Request::SetAdaptiveLevel { value: 50 },
                 r#"{"cmd":"set_adaptive_level","value":50}"#,
             ),
+            (
+                Request::SetSetting {
+                    setting: SettingCommand::Microphone(MicrophoneMode::Auto),
+                },
+                r#"{"cmd":"set_setting","key":"microphone","value":"auto"}"#,
+            ),
+            (
+                Request::Rename {
+                    name: "Auré".into(),
+                },
+                r#"{"cmd":"rename","name":"Auré"}"#,
+            ),
             (Request::Reconnect, r#"{"cmd":"reconnect"}"#),
+            (Request::ConnectOnce, r#"{"cmd":"connect_once"}"#),
             (Request::Status, r#"{"cmd":"status"}"#),
+            (Request::Subscribe, r#"{"cmd":"subscribe"}"#),
         ];
         for (req, wire) in cases {
             assert_eq!(serde_json::to_string(&req).unwrap(), wire);

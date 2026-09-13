@@ -1,5 +1,7 @@
 import QtCore
 import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls as QQC
 import Quickshell
 import Quickshell.Io
 import qs.Common
@@ -9,12 +11,18 @@ import qs.Modules.Plugins
 
 // auris: AirPods battery per bud and case, ear detection and noise control.
 //
-// All data comes from $XDG_RUNTIME_DIR/aurisd/state.json, which the aurisd
-// daemon rewrites atomically (tmp file + rename). Control goes the other way
-// through the `auris` CLI, which talks to the daemon over its own socket.
+// Live data comes from an aurisd control-socket subscription, with
+// $XDG_RUNTIME_DIR/aurisd/state.json as a fallback. Control goes the other way
+// through the `auris` CLI, which talks to the same daemon socket.
 // The plugin owns no state of its own beyond the five options on its settings page.
 PluginComponent {
     id: root
+
+    // Bump on development deployments: a reload acknowledgement alone does
+    // not prove the live widget was recreated from the current source.
+    readonly property string uiRevision: "2026-09-13.14-input-updates"
+    Component.onCompleted: console.info("auris: UI loaded revision", uiRevision)
+    Component.onDestruction: console.info("auris: UI unloaded revision", uiRevision)
 
     property var popoutService: null
 
@@ -25,8 +33,6 @@ PluginComponent {
     readonly property int lowThreshold: pluginData.lowThreshold !== undefined ? pluginData.lowThreshold : 20
     readonly property int criticalThreshold: pluginData.criticalThreshold !== undefined ? pluginData.criticalThreshold : 10
     readonly property bool hideWhenDisconnected: pluginData.hideWhenDisconnected !== undefined ? pluginData.hideWhenDisconnected : true
-    readonly property bool popupOnConnect: pluginData.popupOnConnect !== undefined ? pluginData.popupOnConnect : true
-    readonly property int popupSeconds: pluginData.popupSeconds !== undefined ? pluginData.popupSeconds : 6
 
     // Escape hatch for testing and for non-standard install prefixes: the CLI is
     // looked up on PATH unless pluginData.ctlCommand names something else.
@@ -47,6 +53,7 @@ PluginComponent {
     // daemon leaves the last known battery on screen rather than blanking it.
     property var st: null
     property bool daemonUp: false
+    property bool socketStreaming: false
 
     // 1 Hz heartbeat, so "Updated N s ago" moves on its own between file writes.
     property int tick: 0
@@ -56,28 +63,201 @@ PluginComponent {
     // if the accessory never confirms it.
     property string pendingNoise: ""
 
+    // Requested settings deliberately live outside `st`: a successful CLI exit
+    // means the request was sent, never that the accessory applied it. Entries
+    // are independent by key so editing microphone never blocks a rename.
+    property var pendingAdvanced: ({})
+    property int pendingAdvancedSerial: 0
+    property bool advancedReadbackActive: false
+    property bool advancedReadbackSawDown: false
+    property int advancedReadbackSerial: 0
+    property string advancedStatusKind: ""
+    property string advancedStatusText: ""
+    property string advancedToastKind: ""
+    property string advancedToastText: ""
+    property string queuedToastKind: ""
+    property string queuedToastText: ""
+    property int advancedToastRemaining: 0
+
+    function valuesEqual(left, right) {
+        return JSON.stringify(left) === JSON.stringify(right);
+    }
+
+    function pendingAdvancedFor(key) {
+        return pendingAdvanced && pendingAdvanced[key] ? pendingAdvanced[key] : null;
+    }
+
+    function hasAwaitingAdvanced() {
+        return Object.keys(pendingAdvanced || {}).some(key => {
+            const state = pendingAdvanced[key].state;
+            return state === "awaiting" || state === "verifying";
+        });
+    }
+
+    function setAdvancedPending(key, entry) {
+        const next = {};
+        for (const existingKey of Object.keys(pendingAdvanced || {}))
+            next[existingKey] = pendingAdvanced[existingKey];
+        if (entry)
+            next[key] = entry;
+        else
+            delete next[key];
+        pendingAdvanced = next;
+    }
+
+    function clearAdvancedPending(key) {
+        if (key === undefined || key === null) {
+            pendingAdvanced = {};
+            return;
+        }
+        setAdvancedPending(key, null);
+    }
+
+    function showAdvancedToast(kind, message) {
+        advancedStatusKind = kind;
+        advancedStatusText = message;
+        if (advancedToastText.length > 0) {
+            queuedToastKind = kind;
+            queuedToastText = message;
+            return;
+        }
+        advancedToastKind = kind;
+        advancedToastText = message;
+        advancedToastRemaining = 50;
+        advancedToastTimer.restart();
+    }
+
+    function advancedToastBackground(kind) {
+        const base = Theme.surfaceContainerHigh;
+        const accent = advancedToastAccent(kind);
+        // An overlay must obscure the underlying settings, not blend their
+        // labels into its message. Tint an opaque surface, not the window.
+        return Qt.rgba(base.r * 0.8 + accent.r * 0.2, base.g * 0.8 + accent.g * 0.2, base.b * 0.8 + accent.b * 0.2, 1);
+    }
+
+    function dismissAdvancedToast() {
+        advancedToastText = "";
+        advancedToastKind = "";
+        queuedToastText = "";
+        queuedToastKind = "";
+        advancedToastRemaining = 0;
+        advancedToastTimer.stop();
+    }
+
+    function advancedToastAccent(kind) {
+        if (kind === "error")
+            return Theme.error;
+        if (kind === "warning")
+            return Theme.warning;
+        if (kind === "success")
+            return Theme.success;
+        return Theme.primary;
+    }
+
+    function cancelAdvancedPending(reason) {
+        if (Object.keys(pendingAdvanced || {}).length === 0)
+            return;
+        advancedReadbackActive = false;
+        advancedReadbackSawDown = false;
+        advancedReadbackTimeout.stop();
+        pendingAdvancedSerial++;
+        clearAdvancedPending();
+        showAdvancedToast("error", reason);
+    }
+
+    function confirmAdvancedSnapshot(obj) {
+        let confirmed = false;
+        let legacyMatch = false;
+        for (const key of Object.keys(pendingAdvanced || {})) {
+            const request = pendingAdvanced[key];
+            if (!request || request.queued)
+                continue;
+            const matches = key === "rename" ? !!obj.device && obj.device.name === request.target : !!obj.settings && obj.settings[key] !== null && obj.settings[key] !== undefined && advancedTargetsEqual(key, obj.settings[key], request.target);
+            if (matches) {
+                const sequence = settingsReportSequenceFor(obj, key);
+                // A battery-driven snapshot can repeat the prior setting. When
+                // the daemon supplies counters, only a newer report confirms a
+                // request made against that counter.
+                if (request.reportSequence !== null && (sequence === null || sequence <= request.reportSequence))
+                    continue;
+                console.info("auris: setting report matched", key, "report", sequence);
+                clearAdvancedPending(key);
+                if (request.reportSequence === null)
+                    legacyMatch = true;
+                else
+                    confirmed = true;
+            }
+        }
+        if (confirmed)
+            showAdvancedToast("success", "Confirmed by the AirPods.");
+        else if (legacyMatch)
+            showAdvancedToast("pending", "Matches the reported value; this daemon cannot timestamp the echo.");
+    }
+
     function parseState(content) {
         if (!content) {
             daemonUp = false;
-            return;
+            cancelAdvancedPending("Request cancelled because aurisd became unavailable.");
+            return false;
         }
         try {
             const obj = JSON.parse(content);
-            if (!obj || typeof obj !== "object")
-                return;
-            const wasConnected = connected;
+            // The control socket answers a bad request with {"ok":false,...} on
+            // the same connection, so require the snapshot's schema marker
+            // rather than accepting any object.
+            if (!obj || typeof obj !== "object" || obj.schema === undefined)
+                return false;
             const hadState = st !== null;
+            const oldAddress = dev && typeof dev.address === "string" ? dev.address : "";
+            const oldModelId = dev && typeof dev.model_id === "string" ? dev.model_id : "";
+            const oldAapLink = dev !== null && dev.aap_link === true;
+            const oldSettingsApi = settingsApi;
+            const newDevice = obj.device || null;
+            const newAddress = newDevice && typeof newDevice.address === "string" ? newDevice.address : "";
+            const newModelId = newDevice && typeof newDevice.model_id === "string" ? newDevice.model_id : "";
+            const newAapLink = newDevice !== null && newDevice.aap_link === true;
+            const newSettingsApi = typeof obj.settings_api === "number" ? obj.settings_api : 0;
+            const sessionChanged = hadState && (oldAddress !== newAddress || oldModelId !== newModelId || oldAapLink !== newAapLink || oldSettingsApi !== newSettingsApi);
             st = obj;
             daemonUp = true;
-            if (hadState && !wasConnected && connected && popupOnConnect)
-                connectPopup.restart();
+            if (sessionChanged && Object.keys(pendingAdvanced || {}).length === 0) {
+                advancedStatusKind = "";
+                advancedStatusText = "";
+            }
             if (pendingNoise && obj.noise_control === pendingNoise) {
                 pendingNoise = "";
                 pendingNoiseTimeout.stop();
             }
+            if (!obj.device || obj.device.connected !== true) {
+                cancelAdvancedPending("Request cancelled because the AirPods disconnected.");
+            } else if (obj.settings_api === undefined || obj.settings_api < 1) {
+                cancelAdvancedPending("Request cancelled because this aurisd does not support device settings.");
+            } else if (obj.device.model_id !== "201B") {
+                cancelAdvancedPending("Request cancelled because the connected device changed.");
+            } else if (obj.device.aap_link !== true && advancedReadbackActive) {
+                advancedReadbackSawDown = true;
+            } else if (obj.device.aap_link !== true) {
+                cancelAdvancedPending("Request cancelled because the AirPods settings link closed.");
+            } else {
+                for (const key of Object.keys(pendingAdvanced || {})) {
+                    const request = pendingAdvanced[key];
+                    if (request && request.address.length > 0 && obj.device.address !== request.address) {
+                        cancelAdvancedPending("Request cancelled because the connected device changed.");
+                        break;
+                    }
+                }
+                confirmAdvancedSnapshot(obj);
+                if (advancedReadbackActive && advancedReadbackSawDown) {
+                    advancedReadbackActive = false;
+                    advancedReadbackSawDown = false;
+                    advancedReadbackTimeout.stop();
+                }
+            }
+            return true;
         } catch (e) {
             // Torn read of a file being replaced under us. Keep the old state;
-            // the watch or the poll timer will bring the whole file along shortly.
+            // the next push, or the fallback poll, brings the whole thing along.
+            return false;
         }
     }
 
@@ -88,26 +268,84 @@ PluginComponent {
         blockWrites: true
         watchChanges: true
         printErrors: false
-        onLoaded: root.parseState(text())
+        onLoaded: {
+            if (!root.socketStreaming)
+                root.parseState(text());
+        }
         onLoadFailed: error => {
-            root.daemonUp = false;
+            if (!root.socketStreaming) {
+                root.daemonUp = false;
+                root.cancelAdvancedPending("Request cancelled because aurisd became unavailable.");
+            }
         }
     }
 
-    // The daemon replaces state.json with an atomic rename, which the file
-    // watcher does not always follow, so poll as well: 2 s while the daemon
-    // is up, 3 s while the file is missing. The file is under 1 KiB.
+    // The daemon pushes a snapshot down its control socket on every change, so
+    // the bar appears and disappears in step with the buds instead of up to a
+    // poll interval later. One line of JSON per snapshot, same shape as the file.
+    Socket {
+        id: stateSocket
+
+        path: root.runtimeDir ? root.runtimeDir + "/aurisd/ctl.sock" : ""
+        parser: SplitParser {
+            splitMarker: "\n"
+            onRead: line => {
+                if (root.parseState(line))
+                    root.socketStreaming = true;
+            }
+        }
+        onConnectionStateChanged: {
+            if (connected) {
+                write('{"cmd":"subscribe"}\n');
+                flush();
+            } else {
+                root.socketStreaming = false;
+                root.daemonUp = false;
+                root.cancelAdvancedPending("Request cancelled because aurisd became unavailable.");
+            }
+        }
+    }
+
+    // Dial the socket, and keep dialing while it is down so a daemon restart is
+    // picked up. triggeredOnStart makes the first attempt immediate; `running`
+    // goes false the moment the stream is up, so nothing ticks in the steady state.
     Timer {
-        interval: root.daemonUp ? 2000 : 3000
+        interval: 2000
         repeat: true
-        running: root.statePath !== ""
+        triggeredOnStart: true
+        running: stateSocket.path !== "" && !stateSocket.connected
+        onTriggered: stateSocket.connected = true
+    }
+
+    // Fallback only. The daemon replaces state.json with an atomic rename, which
+    // the file watcher does not always follow, so poll while the push stream is
+    // down. The file is under 1 KiB.
+    Timer {
+        interval: 3000
+        repeat: true
+        running: root.statePath !== "" && !root.socketStreaming
         onTriggered: stateFile.reload()
     }
 
+    // A command acknowledgement can arrive before writer.rs has finished its
+    // 100 ms debounced state-file write. Reloading immediately races that write
+    // and can replace a fresh socket push with the previous value. The socket is
+    // authoritative while it is connected; this delayed refresh exists only
+    // for the file fallback.
+    Timer {
+        id: fallbackCommandRefresh
+
+        interval: 250
+        repeat: false
+        onTriggered: stateFile.reload()
+    }
+
+    // Only while something is on screen to age: hidden, there is nothing to
+    // relabel, and the widget should cost nothing while the buds are away.
     Timer {
         interval: 1000
         repeat: true
-        running: true
+        running: root.wantVisible
         onTriggered: root.tick = (root.tick + 1) % 86400
     }
 
@@ -119,6 +357,68 @@ PluginComponent {
         interval: 5000
         repeat: false
         onTriggered: root.pendingNoise = ""
+    }
+
+    // A missing device echo is useful information, not a failed write. Keep the
+    // per-key requested value until a matching report or a session change.
+    Timer {
+        id: advancedPendingWatch
+
+        interval: 500
+        repeat: true
+        running: root.hasAwaitingAdvanced()
+        onTriggered: {
+            const now = Date.now();
+            root.maybeStartAdvancedReadback(now);
+            for (const key of Object.keys(root.pendingAdvanced || {})) {
+                const request = root.pendingAdvanced[key];
+                if (request && (request.state === "awaiting" || request.state === "verifying") && now - request.sentAt >= 5000) {
+                    request.state = "unconfirmed";
+                    root.setAdvancedPending(key, request);
+                    console.info("auris: setting confirmation timed out", key);
+                    root.showAdvancedToast("warning", "Sent; no device report yet.");
+                }
+            }
+            if (root.advancedReadbackActive && !root.advancedReadbackSawDown && !Object.keys(root.pendingAdvanced || {}).some(key => root.pendingAdvanced[key].state === "verifying")) {
+                root.advancedReadbackActive = false;
+                advancedReadbackTimeout.stop();
+            }
+        }
+    }
+
+    Timer {
+        id: advancedReadbackTimeout
+
+        interval: 10000
+        repeat: false
+        onTriggered: {
+            root.advancedReadbackActive = false;
+            root.advancedReadbackSawDown = false;
+        }
+    }
+
+    Timer {
+        id: advancedToastTimer
+
+        interval: 100
+        repeat: false
+        onTriggered: {
+            root.advancedToastRemaining--;
+            if (root.advancedToastRemaining > 0) {
+                restart();
+                return;
+            }
+            root.advancedToastText = "";
+            root.advancedToastKind = "";
+            if (root.queuedToastText.length > 0) {
+                root.advancedToastKind = root.queuedToastKind;
+                root.advancedToastText = root.queuedToastText;
+                root.queuedToastKind = "";
+                root.queuedToastText = "";
+                root.advancedToastRemaining = 50;
+                restart();
+            }
+        }
     }
 
     // ---- derived state -----------------------------------------------------
@@ -133,10 +433,52 @@ PluginComponent {
     readonly property string firmware: dev && dev.firmware ? dev.firmware : ""
     readonly property string source: st && st.daemon && st.daemon.source ? st.daemon.source : "none"
 
+    readonly property int settingsApi: st && typeof st.settings_api === "number" ? st.settings_api : 0
+    readonly property var confirmedSettings: st && st.settings && typeof st.settings === "object" ? st.settings : null
+    readonly property var settingsReportSeq: st && st.settings_report_seq && typeof st.settings_report_seq === "object" ? st.settings_report_seq : null
+    readonly property bool advancedTargetModel: dev !== null && dev.model_id === "201B"
+    readonly property bool advancedAapLinked: dev !== null && dev.aap_link === true
+    readonly property bool advancedAvailable: daemonUp && connected && settingsApi >= 1 && advancedTargetModel && advancedAapLinked
+    readonly property string confirmedDeviceName: dev && typeof dev.name === "string" ? dev.name : ""
+
+    function confirmedSetting(key) {
+        if (!confirmedSettings || confirmedSettings[key] === undefined || confirmedSettings[key] === null)
+            return null;
+        return confirmedSettings[key];
+    }
+
+    function settingsReportSequenceFor(snapshot, key) {
+        const sequences = snapshot && snapshot.settings_report_seq;
+        if (!sequences || typeof sequences !== "object")
+            return null;
+        return typeof sequences[key] === "number" ? sequences[key] : 0;
+    }
+
+    function settingsReportSequence(key) {
+        if (!settingsReportSeq)
+            return null;
+        return typeof settingsReportSeq[key] === "number" ? settingsReportSeq[key] : 0;
+    }
+
+    readonly property string advancedUnavailableReason: {
+        if (!daemonUp)
+            return "aurisd is unavailable.";
+        if (!connected)
+            return "Connect the AirPods to change device settings.";
+        if (settingsApi < 1)
+            return "Update aurisd to use device settings.";
+        if (!advancedTargetModel)
+            return "Device settings currently target AirPods 4 ANC (model 201B).";
+        if (!advancedAapLinked)
+            return "The AirPods settings link is not available.";
+        return "";
+    }
+
     readonly property string noise: pendingNoise ? pendingNoise : (st && st.noise_control ? st.noise_control : "unknown")
     readonly property bool caKnown: st !== null && st.conversational_awareness !== null && st.conversational_awareness !== undefined
     readonly property bool ca: caKnown && st.conversational_awareness === true
-    readonly property int adaptiveLevel: st && typeof st.adaptive_level === "number" ? st.adaptive_level : 0
+    readonly property bool adaptiveKnown: st !== null && typeof st.adaptive_level === "number"
+    readonly property int adaptiveLevel: adaptiveKnown ? st.adaptive_level : 0
 
     function slot(side) {
         if (!bat || !bat[side])
@@ -153,28 +495,44 @@ PluginComponent {
         const s = slot(side);
         return s !== null && s.present === true;
     }
+    function cellSource(side) {
+        const s = slot(side);
+        return s && typeof s.source === "string" ? s.source : "none";
+    }
+    function cellFresh(side) {
+        const s = slot(side);
+        if (!s || !present(side))
+            return false;
+        // New daemons report freshness per cell. Older snapshots have only a
+        // battery-wide stale bit, so retain their established present fallback.
+        if (typeof s.fresh === "boolean")
+            return s.fresh;
+        return !(bat && bat.stale === true);
+    }
     // Level only while the component is reporting right now; the bar pill
     // must not show a number that could be hours old.
     function liveLevel(side) {
-        return present(side) ? level(side) : -1;
+        return cellLive(side) ? level(side) : -1;
     }
     function seenCaption(side, heartbeat) {
         void heartbeat;
         const s = slot(side);
-        if (!s || s.present === true)
-            return "";
-        if (typeof s.level !== "number")
+        if (!s || !s.last_seen)
             return "not seen yet";
+        const historicalCharge = lastKnownCharging(side);
+        const state = historicalCharge === true ? " charging" : "";
         const secs = s.last_seen ? Math.round((Date.now() - Date.parse(s.last_seen)) / 1000) : NaN;
         if (!isFinite(secs) || secs < 0)
-            return "last known";
+            return "last known" + state;
+        if (secs === 0)
+            return "last seen" + state + " just now";
         if (secs < 60)
-            return "last seen just now";
+            return "last seen" + state + " " + secs + " s ago";
         if (secs < 3600)
-            return "last seen " + Math.round(secs / 60) + " min ago";
+            return "last seen" + state + " " + Math.round(secs / 60) + " min ago";
         if (secs < 86400)
-            return "last seen " + Math.round(secs / 3600) + " h ago";
-        return "last seen " + Math.round(secs / 86400) + " d ago";
+            return "last seen" + state + " " + Math.round(secs / 3600) + " h ago";
+        return "last seen" + state + " " + Math.round(secs / 86400) + " d ago";
     }
     function charging(side) {
         const s = slot(side);
@@ -184,8 +542,53 @@ PluginComponent {
         return ear && ear[side] ? ear[side] : "unknown";
     }
 
-    readonly property int leftLevel: liveLevel("left")
-    readonly property int rightLevel: liveLevel("right")
+    // Charging reports can arrive before the in-case ear event. Exclude either
+    // signal immediately from the bar, while keeping full data in panel rows.
+    function barBudPresent(side) {
+        // A BLE battery observation is not an audio connection and must not
+        // make the bar look connected by itself.
+        return connected && cellLive(side) && !charging(side) && earOf(side) !== "case";
+    }
+
+    function cellLive(side) {
+        return cellFresh(side);
+    }
+    function lastKnownCharging(side) {
+        const s = slot(side);
+        if (!s)
+            return null;
+        if (typeof s.last_known_charging === "boolean")
+            return s.last_known_charging;
+        // Old daemons can still supply a current report, but an absent or stale
+        // legacy record cannot tell us whether its last reading was charging.
+        return cellLive(side) && typeof s.charging === "boolean" ? s.charging : null;
+    }
+    function panelCharging(side) {
+        return cellLive(side) ? charging(side) : lastKnownCharging(side) === true;
+    }
+    function cellCaption(side, heartbeat) {
+        if (!cellLive(side))
+            return seenCaption(side, heartbeat);
+        const observation = cellSource(side) === "ble" ? "BLE observed · audio link not implied" : "";
+        if (side === "case") {
+            const status = charging(side) ? "charging" : level(side) === 0 ? "empty" : st && st.lid === "open" ? "lid open" : "";
+            return observation && status ? observation + " · " + status : observation || status;
+        }
+        const inCase = earOf(side) === "case";
+        if (charging(side))
+            return (observation ? observation + " · " : "") + (inCase ? "in case · charging" : "charging");
+        if (inCase)
+            return (observation ? observation + " · " : "") + "in case" + (level(side) !== 100 && cellLive("case") && level("case") === 0 ? " · case empty" : "");
+        if (earOf(side) === "in")
+            return observation;
+        return (observation ? observation + " · " : "") + (earOf(side) === "out" ? "out of ear" : "ear status unknown");
+    }
+    function cellDim(side) {
+        return !cellLive(side) || (side !== "case" && !charging(side) && earOf(side) === "out");
+    }
+
+    readonly property int leftLevel: barBudPresent("left") ? level("left") : -1
+    readonly property int rightLevel: barBudPresent("right") ? level("right") : -1
     readonly property int caseLevel: liveLevel("case")
 
     readonly property int budsMin: {
@@ -202,8 +605,6 @@ PluginComponent {
             return caseLevel;
         return Math.min(budsMin, caseLevel);
     }
-    readonly property bool anyCharging: charging("left") || charging("right") || charging("case")
-
     readonly property int pillLevel: {
         switch (pillValue) {
         case "all":
@@ -216,20 +617,6 @@ PluginComponent {
             return caseLevel;
         default:
             return budsMin;
-        }
-    }
-    readonly property bool pillCharging: {
-        switch (pillValue) {
-        case "left":
-            return charging("left");
-        case "right":
-            return charging("right");
-        case "case":
-            return charging("case");
-        case "all":
-            return anyCharging;
-        default:
-            return charging("left") || charging("right");
         }
     }
 
@@ -282,6 +669,29 @@ PluginComponent {
         return "Connected, " + noiseLabel;
     }
 
+    readonly property string headerNoiseLabel: {
+        switch (noise) {
+        case "off":
+            return "Off";
+        case "anc":
+            return "ANC";
+        case "transparency":
+            return "Transparency";
+        case "adaptive":
+            return "Adaptive";
+        default:
+            return "Unknown";
+        }
+    }
+
+    readonly property string headerStatus: {
+        if (!daemonUp)
+            return "aurisd unavailable";
+        if (!connected)
+            return "Disconnected";
+        return "Connected  ·  " + headerNoiseLabel;
+    }
+
     // ---- colour ------------------------------------------------------------
     //
     // Same ladder as BatteryService.levelColor, but against this plugin's own
@@ -307,8 +717,7 @@ PluginComponent {
         return stale ? Theme.withAlpha(c, 0.45) : c;
     }
 
-    readonly property color pillColor: dimmed(levelColor(pillLevel, pillCharging))
-    readonly property string pillIcon: connected && daemonUp ? "headphones" : "bluetooth_disabled"
+    readonly property color pillColor: dimmed(levelColor(pillLevel, false))
     readonly property string pillText: pillLevel >= 0 ? pillLevel + "%" : "--"
 
     readonly property string noiseIcon: {
@@ -329,11 +738,11 @@ PluginComponent {
     // ---- control -----------------------------------------------------------
 
     readonly property var ctlProcIds: ({
-        "noise": "auris.ctl.noise",
-        "ca": "auris.ctl.ca",
-        "adaptive": "auris.ctl.adaptive",
-        "reconnect": "auris.ctl.reconnect"
-    })
+            "noise": "auris.ctl.noise",
+            "ca": "auris.ctl.ca",
+            "adaptive": "auris.ctl.adaptive",
+            "reconnect": "auris.ctl.reconnect"
+        })
 
     function ctl(args) {
         // The shell service may run without ~/.local/bin on PATH; prepend it so a
@@ -349,8 +758,168 @@ PluginComponent {
                 ToastService.showError("auris: " + args.join(" ") + " failed", String(stdout || "").trim());
                 return;
             }
-            stateFile.reload();
+            if (!root.socketStreaming)
+                fallbackCommandRefresh.restart();
         });
+    }
+
+    function normalizeListeningCycle(value) {
+        const modes = ["off", "anc", "transparency", "adaptive"];
+        if (!Array.isArray(value))
+            return [];
+        return modes.filter(mode => value.indexOf(mode) >= 0);
+    }
+
+    function advancedTargetsEqual(key, left, right) {
+        if (key === "listening_mode_cycle")
+            return valuesEqual(normalizeListeningCycle(left), normalizeListeningCycle(right));
+        return valuesEqual(left, right);
+    }
+
+    function failAdvancedValidation(message) {
+        showAdvancedToast("error", message);
+    }
+
+    function maybeStartAdvancedReadback(now) {
+        if (advancedReadbackActive)
+            return false;
+        let found = false;
+        const next = {};
+        for (const key of Object.keys(pendingAdvanced || {})) {
+            const request = pendingAdvanced[key];
+            if (request && request.state === "awaiting" && !request.readbackAttempted && now - request.sentAt >= 1000) {
+                request.readbackAttempted = true;
+                request.state = "verifying";
+                found = true;
+            }
+            next[key] = request;
+        }
+        if (!found)
+            return false;
+        pendingAdvanced = next;
+        advancedReadbackActive = true;
+        advancedReadbackSawDown = false;
+        advancedReadbackTimeout.restart();
+        const serial = ++advancedReadbackSerial;
+        console.info("auris: reopening control link for setting readback", serial);
+        const argv = ["sh", "-c", "PATH=\"$HOME/.local/bin:$PATH\" exec \"$0\" \"$@\"", ctlCommand, "reconnect"];
+        Proc.runCommand("auris.ctl.advanced.readback." + serial, argv, (stdout, exitCode) => {
+            if (serial !== root.advancedReadbackSerial)
+                return;
+            if (exitCode !== 0) {
+                root.advancedReadbackActive = false;
+                root.advancedReadbackSawDown = false;
+                advancedReadbackTimeout.stop();
+                root.showAdvancedToast("warning", "Setting sent, but its readback could not be refreshed.");
+            }
+        });
+        return true;
+    }
+
+    function startAdvancedCommand(key, request, target, args) {
+        const commandSerial = ++pendingAdvancedSerial;
+        request.target = target;
+        request.args = args;
+        request.state = "sending";
+        request.inFlightSerial = commandSerial;
+        request.sentAt = 0;
+        request.reportSequence = key === "rename" ? null : settingsReportSequence(key);
+        setAdvancedPending(key, request);
+        // Deliberately log keys/lifecycle only, never names or preference values.
+        console.info("auris: setting command started", key, "request", commandSerial);
+        const argv = ["sh", "-c", "PATH=\"$HOME/.local/bin:$PATH\" exec \"$0\" \"$@\"", ctlCommand].concat(args);
+        Proc.runCommand("auris.ctl.advanced." + key + "." + commandSerial, argv, (stdout, exitCode) => {
+            console.info("auris: setting command completed", key, "request", commandSerial, "exit", exitCode);
+            const current = root.pendingAdvancedFor(key);
+            if (!current || current.inFlightSerial !== commandSerial)
+                return;
+            const queued = current.queued;
+            if (exitCode !== 0) {
+                const detail = String(stdout || "").trim();
+                root.showAdvancedToast("error", detail.length > 0 ? detail : "The setting request failed.");
+                // A rejected/expired request may signal a changed connection.
+                // Do not automatically replay the unsent target into it.
+                root.clearAdvancedPending(key);
+                return;
+            }
+            if (queued) {
+                current.queued = null;
+                root.startAdvancedCommand(key, current, queued.target, queued.args);
+                return;
+            }
+            // This callback has completed. A later click must start a fresh
+            // command instead of queuing behind an already-finished process.
+            current.inFlightSerial = 0;
+            current.state = "awaiting";
+            current.sentAt = Date.now();
+            root.setAdvancedPending(key, current);
+            root.showAdvancedToast("pending", "Sent; waiting for a device report.");
+            if (!root.socketStreaming)
+                fallbackCommandRefresh.restart();
+        });
+    }
+
+    function runAdvancedRequest(key, target, args) {
+        if (!advancedAvailable) {
+            failAdvancedValidation(advancedUnavailableReason);
+            return;
+        }
+        const current = pendingAdvancedFor(key);
+        if (current && current.inFlightSerial) {
+            // Proc runs one process per key. A rapid sequence keeps only the
+            // latest unsent target, so an older callback cannot overwrite it.
+            current.target = target;
+            current.args = args;
+            current.state = "sending";
+            current.queued = {
+                "target": target,
+                "args": args
+            };
+            setAdvancedPending(key, current);
+            return;
+        }
+        const request = {
+            "target": target,
+            "args": args,
+            "address": dev && typeof dev.address === "string" ? dev.address : "",
+            "state": "sending",
+            "inFlightSerial": 0,
+            "sentAt": 0,
+            "reportSequence": null,
+            "readbackAttempted": false,
+            "queued": null
+        };
+        startAdvancedCommand(key, request, target, args);
+    }
+
+    function requestAdvancedRename(name) {
+        if (!advancedAvailable) {
+            failAdvancedValidation(advancedUnavailableReason);
+            return;
+        }
+        if (!pendingAdvancedFor("rename") && name === confirmedDeviceName) {
+            showAdvancedToast("success", "That name is already confirmed.");
+            return;
+        }
+        runAdvancedRequest("rename", name, ["rename", name]);
+    }
+
+    function requestAdvancedSetting(key, value) {
+        if (!advancedAvailable) {
+            failAdvancedValidation(advancedUnavailableReason);
+            return;
+        }
+        let target = value;
+        if (key === "listening_mode_cycle")
+            target = normalizeListeningCycle(value);
+        // A rapid revert can legitimately equal the old confirmed value while
+        // another requested value is still in flight. Only suppress a true
+        // no-op when this key has no outstanding requested target.
+        if (!pendingAdvancedFor(key) && advancedTargetsEqual(key, confirmedSetting(key), target)) {
+            showAdvancedToast("success", "That value is already confirmed.");
+            return;
+        }
+        runAdvancedRequest(key, target, ["setting", key, JSON.stringify(target)]);
     }
 
     function setNoise(mode) {
@@ -388,35 +957,52 @@ PluginComponent {
         onTriggered: root.setVisibilityOverride(root.wantVisible)
     }
 
-    // ---- connect popup -----------------------------------------------------
-    //
-    // On the disconnected -> connected edge, open the stats popout for a few
-    // seconds, the way macOS shows the battery card when AirPods connect. The
-    // pill may have been hidden a moment ago, so wait one layout pass before
-    // asking the base class to anchor the popout to it.
-    Timer {
-        id: connectPopup
-        interval: 400
-        repeat: false
-        onTriggered: {
-            if (!root.connected || (root.popoutRef && root.popoutRef.shouldBeVisible))
-                return;
-            root.triggerPopout();
-            connectPopupClose.restart();
-        }
-    }
-
-    Timer {
-        id: connectPopupClose
-        interval: root.popupSeconds * 1000
-        repeat: false
-        onTriggered: {
-            if (root.popoutRef && root.popoutRef.shouldBeVisible)
-                root.closePopout();
-        }
-    }
-
     // ---- bar ---------------------------------------------------------------
+
+    // Show only buds outside the case. If none are known to be available, a
+    // neutral Bluetooth icon keeps the panel accessible without inventing buds.
+    component PillPodsIcon: Item {
+        id: pillPods
+
+        readonly property bool showLeft: root.barBudPresent("left")
+        readonly property bool showRight: root.barBudPresent("right")
+        readonly property bool showBoth: showLeft && showRight
+        readonly property int budSize: showBoth ? Math.max(14, root.iconSize - 3) : root.iconSize
+        // The right silhouette ends at .662s and the mirrored left begins at
+        // .338s. Overlap their transparent canvases so the *visible* gap is
+        // 1.5 px rather than the much larger gap produced by square spacing.
+        readonly property real visibleBudGap: 1.5
+        readonly property real pairedOffset: budSize * (0.662 - 0.338) + visibleBudGap
+        width: showBoth ? pairedOffset + budSize : budSize
+        height: root.iconSize
+
+        PodIcon {
+            visible: pillPods.showLeft
+            // Ear identity, not pair/charging state, determines orientation.
+            kind: "left"
+            size: pillPods.budSize
+            color: root.pillColor
+            x: pillPods.showBoth ? pillPods.pairedOffset : (pillPods.width - width) / 2
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        PodIcon {
+            visible: pillPods.showRight
+            kind: "right"
+            size: pillPods.budSize
+            color: root.pillColor
+            x: pillPods.showBoth ? 0 : (pillPods.width - width) / 2
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        DankIcon {
+            visible: !pillPods.showLeft && !pillPods.showRight
+            name: "bluetooth_connected"
+            size: pillPods.budSize
+            color: root.pillColor
+            anchors.centerIn: parent
+        }
+    }
 
     // Right click flips between ANC and Transparency, the only two modes worth
     // swapping without looking at the panel.
@@ -426,21 +1012,18 @@ PluginComponent {
         Row {
             spacing: Theme.spacingXS
 
-            DankIcon {
+            PillPodsIcon {
                 anchors.verticalCenter: parent.verticalCenter
-                name: root.pillIcon
-                filled: root.connected && !root.stale
-                size: root.iconSize
-                color: root.pillColor
+                visible: root.connected && root.daemonUp
             }
 
             DankIcon {
                 anchors.verticalCenter: parent.verticalCenter
-                visible: root.anyCharging && root.connected
-                name: "bolt"
-                filled: true
-                size: Theme.iconSizeSmall - 2
-                color: root.dimmed(Theme.success)
+                visible: !root.connected || !root.daemonUp
+                name: "bluetooth_disabled"
+                filled: false
+                size: root.iconSize
+                color: root.pillColor
             }
 
             StyledText {
@@ -457,10 +1040,16 @@ PluginComponent {
         Column {
             spacing: Theme.spacingXS
 
+            PillPodsIcon {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: root.connected && root.daemonUp
+            }
+
             DankIcon {
                 anchors.horizontalCenter: parent.horizontalCenter
-                name: root.pillIcon
-                filled: root.connected && !root.stale
+                visible: !root.connected || !root.daemonUp
+                name: "bluetooth_disabled"
+                filled: false
                 size: root.iconSize
                 color: root.pillColor
             }
@@ -480,8 +1069,8 @@ PluginComponent {
     // One battery line: icon, label, track, bolt, percentage. DMS ships no
     // progress bar widget, so the track is a Rectangle with a second Rectangle
     // clipped inside it.
-    // The Material Symbols font has no AirPods glyphs, so the three row icons
-    // are drawn by hand: a left bud, a right bud (mirrored) and the case.
+    // Original filled bud and case drawings. The base silhouette is the right
+    // bud; mirror it for the left everywhere (bar, battery rows and CC).
     component PodIcon: Canvas {
         id: pod
 
@@ -507,7 +1096,6 @@ PluginComponent {
                 ctx.beginPath();
                 ctx.roundedRect(x, y, w, h, r, r);
                 ctx.fill();
-                // carve the lid seam and the status light out of the body
                 ctx.globalCompositeOperation = "destination-out";
                 const seam = y + h * 0.4;
                 ctx.fillRect(x, seam - s * 0.035, w, s * 0.07);
@@ -517,22 +1105,48 @@ PluginComponent {
                 ctx.globalCompositeOperation = "source-over";
                 return;
             }
+
             ctx.save();
-            if (pod.kind === "right") {
+            if (pod.kind === "left") {
                 ctx.translate(s, 0);
                 ctx.scale(-1, 1);
             }
-            // oval head, tilted a touch, with a straight stem hanging off its inner side
-            const hx = s * 0.4, hy = s * 0.32;
-            ctx.save();
-            ctx.translate(hx, hy);
+
+            // Original filled silhouette, with the stem shortened from .60s.
+            ctx.beginPath();
+            ctx.roundedRect(s * 0.47, s * 0.36, s * 0.19, s * 0.48, s * 0.095, s * 0.095);
+            ctx.fill();
+            ctx.translate(s * 0.4, s * 0.32);
             ctx.rotate(-0.35);
             ctx.beginPath();
+            // Qt's ellipse takes a bounding rectangle, not browser radii.
             ctx.ellipse(-s * 0.27, -s * 0.2, s * 0.54, s * 0.4);
             ctx.fill();
-            ctx.restore();
+
+            // The speaker opening sits on the listening face; mirroring the
+            // whole drawing keeps it on the correct side for each bud.
+            ctx.fillStyle = "#20242c";
             ctx.beginPath();
-            ctx.roundedRect(s * 0.47, s * 0.36, s * 0.19, s * 0.6, s * 0.095, s * 0.095);
+            ctx.ellipse(-s * 0.205, -s * 0.13, s * 0.15, s * 0.26);
+            ctx.fill();
+            // At bar size the dark oval suggests mesh. Resolve its fine ribs
+            // only at larger sizes, where they won't turn into pixel noise.
+            if (s >= 32) {
+                ctx.save();
+                ctx.clip();
+                ctx.strokeStyle = "#555d68";
+                ctx.lineWidth = s * 0.012;
+                for (let row = -2; row <= 2; row++) {
+                    ctx.beginPath();
+                    ctx.moveTo(-s * 0.205, row * s * 0.045);
+                    ctx.lineTo(-s * 0.055, row * s * 0.045);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            }
+            // Small outer vent, separate from the larger speaker grille.
+            ctx.beginPath();
+            ctx.ellipse(s * 0.095, -s * 0.05, s * 0.075, s * 0.1);
             ctx.fill();
             ctx.restore();
         }
@@ -540,6 +1154,7 @@ PluginComponent {
 
     component BatteryRow: Item {
         id: batteryRow
+        objectName: "battery" + label
 
         property string label: ""
         property string iconKind: "left"
@@ -550,17 +1165,13 @@ PluginComponent {
 
         readonly property bool hasCaption: caption.length > 0
 
-        height: hasCaption ? 46 : 32
+        // Presence, freshness and the expected AAP readback reconnect can all
+        // add or clear a caption. Reserve its line permanently: status changes
+        // may alter text and tint, never battery-card or panel geometry.
+        height: 50
         opacity: dim ? 0.5 : 1
 
         Behavior on opacity {
-            NumberAnimation {
-                duration: Theme.shortDuration
-                easing.type: Theme.standardEasing
-            }
-        }
-
-        Behavior on height {
             NumberAnimation {
                 duration: Theme.shortDuration
                 easing.type: Theme.standardEasing
@@ -573,7 +1184,7 @@ PluginComponent {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
-            height: 32
+            height: 34
 
             PodIcon {
                 id: rowIcon
@@ -582,7 +1193,7 @@ PluginComponent {
                 anchors.verticalCenter: parent.verticalCenter
                 kind: batteryRow.iconKind
                 size: Theme.iconSize - 2
-                color: root.dimmed(Theme.surfaceText)
+                color: Theme.surfaceText
             }
 
             StyledText {
@@ -591,47 +1202,62 @@ PluginComponent {
                 anchors.left: rowIcon.right
                 anchors.leftMargin: Theme.spacingM
                 anchors.verticalCenter: parent.verticalCenter
-                width: 52
+                width: 56
                 text: batteryRow.label
                 font.pixelSize: Theme.fontSizeSmall
-                color: root.dimmed(Theme.surfaceText)
+                color: Theme.surfaceText
                 elide: Text.ElideRight
             }
 
-            StyledText {
-                id: rowPercent
-
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                width: 42
-                horizontalAlignment: Text.AlignRight
-                text: batteryRow.level >= 0 ? batteryRow.level + "%" : "--"
+            FontMetrics {
+                id: percentMetrics
+                font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSizeSmall
-                color: root.dimmed(root.levelColor(batteryRow.level, batteryRow.charging))
             }
 
-            DankIcon {
-                id: rowBolt
-
-                anchors.right: rowPercent.left
-                anchors.rightMargin: Theme.spacingXS
+            Item {
+                id: reading
+                anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                visible: batteryRow.charging
-                name: "bolt"
-                filled: true
-                size: Theme.iconSizeSmall - 2
-                color: root.dimmed(Theme.success)
+                // Reserve the same reading column in every row, even with no
+                // bolt, so the battery tracks never change length on charging.
+                width: Math.ceil(percentMetrics.advanceWidth("100%")) + 16
+                height: parent.height
+
+                StyledText {
+                    id: rowPercent
+                    objectName: "batteryPercent"
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: batteryRow.level >= 0 ? batteryRow.level + "%" : "--"
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: root.levelColor(batteryRow.level, batteryRow.charging)
+                }
+
+                DankIcon {
+                    id: rowBolt
+                    objectName: "batteryChargingBolt"
+                    anchors.right: rowPercent.left
+                    anchors.rightMargin: 4
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: batteryRow.charging
+                    name: "bolt"
+                    filled: true
+                    size: 12
+                    color: Theme.success
+                }
             }
 
             Rectangle {
                 id: rowTrack
+                objectName: "batteryTrack"
 
                 anchors.left: rowLabel.right
-                anchors.leftMargin: Theme.spacingM
-                anchors.right: rowBolt.visible ? rowBolt.left : rowPercent.left
-                anchors.rightMargin: Theme.spacingM
+                anchors.leftMargin: Theme.spacingL
+                anchors.right: reading.left
+                anchors.rightMargin: Theme.spacingL
                 anchors.verticalCenter: parent.verticalCenter
-                height: 6
+                height: 7
                 radius: height / 2
                 color: Theme.withAlpha(Theme.surfaceVariantText, 0.22)
 
@@ -639,7 +1265,7 @@ PluginComponent {
                     width: batteryRow.level >= 0 ? Math.max(parent.height, parent.width * batteryRow.level / 100) : 0
                     height: parent.height
                     radius: parent.radius
-                    color: root.dimmed(root.levelColor(batteryRow.level, batteryRow.charging))
+                    color: root.levelColor(batteryRow.level, batteryRow.charging)
 
                     Behavior on width {
                         NumberAnimation {
@@ -657,8 +1283,8 @@ PluginComponent {
             anchors.leftMargin: rowIcon.width + Theme.spacingM
             anchors.right: parent.right
             anchors.top: line.bottom
-            anchors.topMargin: -2
-            visible: batteryRow.hasCaption
+            height: 16
+            opacity: batteryRow.hasCaption ? 1 : 0
             text: batteryRow.caption
             font.pixelSize: Theme.fontSizeSmall - 1
             color: Theme.surfaceVariantText
@@ -666,193 +1292,800 @@ PluginComponent {
         }
     }
 
-    function earCaption(side) {
-        switch (earOf(side)) {
-        case "out":
-            return "out of ear";
-        case "case":
-            return "in case";
-        case "in":
-            return "";
-        default:
-            return connected ? "unknown" : "";
+    // One track carved into cells, rather than four buttons sized to their own
+    // labels. Each cell is its label plus an equal share of the leftover room,
+    // so every segment carries the same padding around its text and the two end
+    // gutters match by construction. Equal-width cells cannot do that: "Off"
+    // swims in its quarter while "Transparency" touches both edges.
+    component NoiseSegments: Item {
+        id: seg
+
+        readonly property var labels: ["Off", "ANC", "Transparency", "Adaptive"]
+        // Gap between the track and the moving fill, on all four sides.
+        readonly property real trackPad: 4
+        // The least room a label may keep beside it. Below this the share-out
+        // has nothing left to give and an even split is the tidier failure.
+        readonly property real minPad: Theme.spacingM
+
+        readonly property var cells: {
+            const inner = Math.max(0, width - trackPad * 2);
+            const natural = labels.map(l => Math.ceil(segMetrics.advanceWidth(l)));
+            const used = natural.reduce((a, b) => a + b, 0);
+            const share = (inner - used) / labels.length;
+            const roomy = share >= minPad * 2;
+            const out = [];
+            let x = trackPad;
+            for (let i = 0; i < labels.length; i++) {
+                const w = roomy ? natural[i] + share : inner / labels.length;
+                out.push({
+                    "x": x,
+                    "w": w,
+                    "roomy": roomy
+                });
+                x += w;
+            }
+            return out;
+        }
+
+        // How close a label may come to its cell edge. Once the cells are down
+        // to an even split there is no room to spend, so the label is allowed
+        // nearer the edge rather than being shrunk to keep a gap it cannot have.
+        readonly property real textInset: cells.length > 0 && cells[0].roomy ? minPad : Theme.spacingS
+
+        height: 40
+        enabled: root.connected
+        opacity: enabled ? 1 : 0.45
+
+        // Measured at the weight the selected label uses, so a cell never has to
+        // grow or clip when the selection lands on it.
+        FontMetrics {
+            id: segMetrics
+
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fontSizeSmall
+            font.weight: Font.Medium
+        }
+
+        Behavior on opacity {
+            NumberAnimation {
+                duration: Theme.shortDuration
+                easing.type: Theme.standardEasing
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: height / 2
+            color: Theme.withAlpha(Theme.surfaceVariant, 0.45)
+            border.color: Theme.outlineMedium
+            border.width: Theme.layerOutlineWidth
+        }
+
+        // Sliding the fill is what makes this read as one control with a
+        // position, instead of four separate buttons.
+        Rectangle {
+            readonly property var geom: seg.cells[Math.max(0, root.noiseIndex)]
+
+            x: geom ? geom.x : seg.trackPad
+            y: seg.trackPad
+            width: geom ? geom.w : 0
+            height: parent.height - seg.trackPad * 2
+            radius: height / 2
+            color: Theme.primary
+            visible: root.noiseIndex >= 0
+
+            Behavior on x {
+                NumberAnimation {
+                    duration: Theme.mediumDuration
+                    easing.type: Theme.emphasizedEasing
+                }
+            }
+
+            Behavior on width {
+                NumberAnimation {
+                    duration: Theme.mediumDuration
+                    easing.type: Theme.emphasizedEasing
+                }
+            }
+        }
+
+        Repeater {
+            model: seg.labels
+
+            Item {
+                id: cell
+
+                required property int index
+                required property string modelData
+
+                readonly property bool selected: index === root.noiseIndex
+                readonly property var geom: seg.cells[index]
+
+                x: geom ? geom.x : 0
+                y: seg.trackPad
+                width: geom ? geom.w : 0
+                height: seg.height - seg.trackPad * 2
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: height / 2
+                    color: Theme.withAlpha(Theme.surfaceText, 0.07)
+                    visible: cellHover.hovered && !cell.selected
+                }
+
+                StyledText {
+                    anchors.centerIn: parent
+                    width: parent.width - seg.textInset * 2
+                    text: cell.modelData
+                    horizontalAlignment: Text.AlignHCenter
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: cell.selected ? Font.Medium : Font.Normal
+                    // Only bites if the user runs a large UI font; all four
+                    // shrink together, so they stay even.
+                    fontSizeMode: Text.HorizontalFit
+                    minimumPixelSize: Theme.fontSizeSmall - 2
+                    color: cell.selected ? Theme.primaryText : Theme.surfaceVariantText
+
+                    Behavior on color {
+                        ColorAnimation {
+                            duration: Theme.shortDuration
+                        }
+                    }
+                }
+
+                HoverHandler {
+                    id: cellHover
+
+                    enabled: seg.enabled
+                    cursorShape: Qt.PointingHandCursor
+                }
+
+                TapHandler {
+                    enabled: seg.enabled
+                    onTapped: root.setNoise(root.noiseModes[cell.index])
+                }
+            }
         }
     }
 
     // ---- panel -------------------------------------------------------------
 
-    popoutWidth: 400
-    popoutHeight: 460
+    TextMetrics {
+        id: cycleLabelMetrics
+        text: "Transparency"
+        font.family: Theme.fontFamily
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Medium
+    }
+    TextMetrics {
+        id: callLabelMetrics
+        text: "1× end call · 2× mute"
+        font: cycleLabelMetrics.font
+    }
+    // Measure while the plugin is loaded, not when setup is expanded: opening
+    // the disclosure must never change the panel width or reflow quick controls.
+    readonly property real preferredPanelWidth: Math.ceil(Math.max(420, Math.max(4 * (cycleLabelMetrics.advanceWidth + Theme.spacingM * 2) + Theme.spacingS * 3, 2 * (callLabelMetrics.advanceWidth + Theme.spacingM * 2) + Theme.spacingS) + Theme.spacingL * 2 + Theme.spacingS * 4))
+    popoutWidth: Math.min(preferredPanelWidth, Math.max(0, (root.parentScreen?.width ?? 1920) - 32))
+    // Only the size before the first layout: the host rebinds this to the
+    // content's own height once the panel is loaded.
+    popoutHeight: 520
+
+    // Inside the panel cards. A step up from the gap between them, so content
+    // sits clearly within its surface instead of against the edge.
+    readonly property real cardPad: Theme.spacingL
+    readonly property real controlsPadX: Theme.spacingS
+    readonly property real controlsPadY: Theme.spacingM
 
     // The base class keeps its popout object private; PopoutComponent gets a
     // parentPopout reference when it is loaded, so pass it up here.
     property var popoutRef: null
 
+    Loader {
+        // Explicit URL also works in an engine with a cached directory listing.
+        source: Qt.resolvedUrl("components/PopoutInputUpdates.qml") + "?v=" + root.uiRevision
+        onLoaded: item.popout = Qt.binding(() => root.popoutRef)
+    }
+
+    // Qt caches directory listings independently of component URLs. Keeping
+    // settings in its own directory avoids a stale plugin-root listing when
+    // this component is first installed while the shell is already running.
+    readonly property url deviceSettingsUrl: Qt.resolvedUrl("components/settings/AurisAdvancedSettings.qml") + "?t=" + Date.now()
+
+    component HelpButton: DankActionButton {
+        id: helpButton
+        property string helpText: ""
+        property bool helpOpen: false
+        readonly property var helpPopup: clickTooltip
+        buttonSize: 28
+        iconSize: 16
+        iconName: "info"
+        iconColor: Theme.surfaceVariantText
+        // Click help is the only tooltip owner. DMS's hover StateLayer leaves
+        // an already-open tooltip alive if tooltipText is cleared on click.
+        tooltipText: null
+        onClicked: helpOpen = !helpOpen
+        onVisibleChanged: if (!visible)
+            helpOpen = false
+
+        QQC.ToolTip {
+            id: clickTooltip
+            parent: helpButton
+            x: helpButton.width - width
+            y: helpButton.height + Theme.spacingXS
+            width: 280
+            margins: Theme.spacingS
+            focus: true
+            visible: helpButton.helpOpen && helpButton.visible
+            timeout: -1
+            onClosed: helpButton.helpOpen = false
+            contentItem: Text {
+                text: helpButton.helpText
+                wrapMode: Text.WordWrap
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeSmall
+            }
+            background: Rectangle {
+                radius: Theme.cornerRadius
+                color: Theme.surfaceContainerHigh
+                border.color: Theme.outlineMedium
+                border.width: Theme.layerOutlineWidth
+            }
+        }
+    }
+
     popoutContent: Component {
         PopoutComponent {
-            onParentPopoutChanged: root.popoutRef = parentPopout
             id: popout
+            readonly property real screenSpace: (root.parentScreen ? root.parentScreen.height : 900) - root.barThickness
+            // Normally reserve 96px for the shell. On short screens use some
+            // of that slack so setup still has a usable viewport; never borrow
+            // space from the fixed quick controls or extend beyond the screen.
+            readonly property real verticalBudget: Math.max(0, Math.min(screenSpace - 32, Math.max(screenSpace - 96, 80 + quickControls.height + 128)))
+            onParentPopoutChanged: {
+                root.popoutRef = parentPopout;
+                // Keep the fixed native surface used by DMS's own large popouts.
+                if (parentPopout && "fullHeightSurface" in parentPopout)
+                    parentPopout.fullHeightSurface = true;
+            }
+            // DMS owns the one height animation. Reveal at its rendered height
+            // instead of scaling the content or adding a second animation.
+            clip: true
+            height: parentPopout && typeof parentPopout.renderedAlignedHeight === "number" ? Math.max(0, parentPopout.renderedAlignedHeight - Theme.spacingS * 2) : implicitHeight
 
-            headerText: root.deviceName
-            detailsText: root.statusLine
-            showCloseButton: true
+            headerText: ""
+            detailsText: ""
+            showCloseButton: false
 
-            Column {
-                width: parent.width
+            Connections {
+                target: popout.parentPopout
+                ignoreUnknownSignals: true
+
+                function onShouldBeVisibleChanged() {
+                    if (!popout.parentPopout || !popout.parentPopout.shouldBeVisible) {
+                        panelScroll.contentY = 0;
+                        technical.expanded = false;
+                        adaptiveHelp.helpOpen = false;
+                    }
+                }
+            }
+
+            // Inset to line the cards up with the header text, which the host
+            // indents by spacingS. Flush cards under an indented title is the
+            // kind of half-pixel mismatch that reads as sloppy without anyone
+            // being able to say why.
+            RowLayout {
+                id: panelHeader
+                objectName: "aurisPanelHeader"
+                x: Theme.spacingS
+                width: parent.width - Theme.spacingS * 2
+                height: 40
                 spacing: Theme.spacingM
 
-                StyledRect {
-                    width: parent.width
-                    height: rows.implicitHeight + Theme.spacingL * 2
-                    radius: Theme.cornerRadius
-                    color: Theme.floatingWindowNestedSurface
-                    border.color: Theme.outlineMedium
-                    border.width: Theme.layerOutlineWidth
-                    opacity: root.stale ? 0.55 : 1
+                StyledText {
+                    objectName: "aurisPanelTitle"
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    Layout.alignment: Qt.AlignVCenter
+                    text: root.model || root.deviceName
+                    font.pixelSize: Theme.fontSizeXLarge - 2
+                    font.weight: Font.Bold
+                    color: Theme.surfaceText
+                    elide: Text.ElideRight
+                }
 
-                    Column {
-                        id: rows
+                StyledText {
+                    objectName: "aurisPanelStatus"
+                    // Reserve at least half the text area for the model on
+                    // narrow screens; both labels elide instead of overlapping.
+                    Layout.maximumWidth: Math.max(0, (panelHeader.width - 36 - panelHeader.spacing * 2) / 2)
+                    Layout.preferredWidth: implicitWidth
+                    Layout.minimumWidth: 0
+                    Layout.alignment: Qt.AlignVCenter
+                    text: root.headerStatus
+                    horizontalAlignment: Text.AlignRight
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                }
 
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingL
-                        spacing: Theme.spacingS
+                DankActionButton {
+                    objectName: "aurisPanelClose"
+                    Layout.preferredWidth: 36
+                    Layout.preferredHeight: 36
+                    iconName: "close"
+                    iconSize: Theme.iconSizeSmall
+                    iconColor: Theme.surfaceVariantText
+                    backgroundColor: "transparent"
+                    buttonSize: 36
+                    onClicked: root.closePopout()
+                }
+            }
 
-                        BatteryRow {
-                            width: parent.width
-                            label: "Left"
-                            iconKind: "left"
-                            level: root.level("left")
-                            charging: root.charging("left")
-                            caption: root.present("left") ? root.earCaption("left") : root.seenCaption("left", root.tick)
-                            dim: !root.present("left") || (root.connected && root.earOf("left") !== "in")
+            StyledRect {
+                id: quickControls
+                objectName: "aurisQuickControls"
+                // Also owns the non-positioned toast layer. Its own geometry
+                // still comes solely from quickColumn, never the overlay.
+                z: 1
+                x: Theme.spacingS
+                width: parent.width - Theme.spacingS * 2
+                height: quickColumn.implicitHeight + root.controlsPadY * 2
+                radius: Theme.cornerRadius
+                color: Theme.floatingWindowNestedSurface
+                border.color: Theme.outlineMedium
+                border.width: Theme.layerOutlineWidth
+
+                Column {
+                    id: quickColumn
+                    x: root.controlsPadX
+                    y: root.controlsPadY
+                    width: parent.width - root.controlsPadX * 2
+                    spacing: Theme.spacingXS
+
+                    NoiseSegments {
+                        objectName: "aurisNoiseModes"
+                        width: parent.width
+                    }
+
+                    DankToggle {
+                        objectName: "aurisConversationToggle"
+                        width: parent.width
+                        height: 36
+                        text: "Conversation awareness"
+                        checked: root.ca
+                        enabled: root.daemonUp && root.connected && root.caKnown
+                        onToggled: isChecked => root.setConversationalAwareness(isChecked)
+                    }
+
+                    RowLayout {
+                        objectName: "aurisAdaptiveControl"
+                        width: parent.width
+                        visible: root.noise === "adaptive"
+                        height: adaptiveSlider.implicitHeight
+                        spacing: Theme.spacingXS
+                        StyledText {
+                            Layout.preferredWidth: 96
+                            text: "Adaptive · " + (root.adaptiveKnown ? root.adaptiveLevel + "%" : "—")
+                            elide: Text.ElideRight
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
                         }
-
-                        BatteryRow {
-                            width: parent.width
-                            label: "Right"
-                            iconKind: "right"
-                            level: root.level("right")
-                            charging: root.charging("right")
-                            caption: root.present("right") ? root.earCaption("right") : root.seenCaption("right", root.tick)
-                            dim: !root.present("right") || (root.connected && root.earOf("right") !== "in")
+                        DankSlider {
+                            id: adaptiveSlider
+                            objectName: "aurisAdaptiveSlider"
+                            Layout.fillWidth: true
+                            minimum: 0
+                            maximum: 100
+                            step: 5
+                            unit: "%"
+                            value: root.adaptiveLevel
+                            enabled: root.daemonUp && root.connected && root.advancedAapLinked && root.noise === "adaptive"
+                            onSliderDragFinished: finalValue => root.setAdaptiveLevel(finalValue)
                         }
-
-                        BatteryRow {
-                            width: parent.width
-                            label: "Case"
-                            iconKind: "case"
-                            level: root.level("case")
-                            charging: root.charging("case")
-                            caption: root.present("case") ? (root.st && root.st.lid === "open" ? "lid open" : "") : root.seenCaption("case", root.tick)
-                            dim: !root.present("case")
+                        HelpButton {
+                            id: adaptiveHelp
+                            objectName: "aurisAdaptiveHelp"
+                            helpText: "Adjusts how much surrounding sound Adaptive mode allows. This is not media volume or a measured noise-cancellation percentage. A dash means the value has not been reported. Requires the control link."
                         }
                     }
                 }
+            }
 
-                StyledRect {
+            DankFlickable {
+                id: panelScroll
+                objectName: "aurisMainScroll"
+                x: Theme.spacingS
+                width: parent.width - Theme.spacingS * 2
+                // Quick controls never scroll. Only battery rows may need a
+                // small viewport on a short screen with setup expanded.
+                height: Math.min(contentHeight, Math.max(0, popout.verticalBudget - 40 - quickControls.height - 40 - (technical.expanded ? 128 : 0)))
+                contentWidth: width
+                contentHeight: mainPage.implicitHeight + Theme.spacingS
+                clip: true
+                Column {
+                    id: mainPage
+                    width: panelScroll.width
+                    topPadding: Theme.spacingS
+                    StyledRect {
+                        width: parent.width
+                        height: rows.implicitHeight + root.cardPad * 2
+                        radius: Theme.cornerRadius
+                        color: Theme.floatingWindowNestedSurface
+                        border.color: Theme.outlineMedium
+                        border.width: Theme.layerOutlineWidth
+
+                        Column {
+                            id: rows
+
+                            anchors.fill: parent
+                            anchors.margins: root.cardPad
+                            spacing: Theme.spacingM
+
+                            BatteryRow {
+                                width: parent.width
+                                label: "Left"
+                                iconKind: "left"
+                                level: root.level("left")
+                                charging: root.panelCharging("left")
+                                caption: root.cellCaption("left", root.tick)
+                                dim: root.cellDim("left")
+                            }
+
+                            BatteryRow {
+                                width: parent.width
+                                label: "Right"
+                                iconKind: "right"
+                                level: root.level("right")
+                                charging: root.panelCharging("right")
+                                caption: root.cellCaption("right", root.tick)
+                                dim: root.cellDim("right")
+                            }
+
+                            BatteryRow {
+                                width: parent.width
+                                label: "Case"
+                                iconKind: "case"
+                                level: root.level("case")
+                                charging: root.panelCharging("case")
+                                caption: root.cellCaption("case", root.tick)
+                                dim: root.cellDim("case")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Item {
+                id: technical
+                objectName: "aurisTechnicalDisclosure"
+                property bool expanded: false
+                readonly property real feedbackSlotHeight: 52
+                x: Theme.spacingS
+                width: parent.width - Theme.spacingS * 2
+                implicitHeight: 40 + (expanded ? technicalScroll.height + Theme.spacingS : 0)
+                height: implicitHeight
+                onExpandedChanged: {
+                    if (!expanded) {
+                        if (deviceSettings.item)
+                            deviceSettings.item.activeHelpKey = "";
+                        root.dismissAdvancedToast();
+                    }
+                }
+
+                DankActionButton {
+                    objectName: "aurisSetupDisclosureButton"
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    iconName: technical.expanded ? "keyboard_arrow_up" : "keyboard_arrow_down"
+                    buttonSize: 36
+                    iconSize: 20
+                    iconColor: Theme.surfaceVariantText
+                    // The disclosure chevron is self-explanatory; null avoids
+                    // a second tooltip owner beside click-only help controls.
+                    tooltipText: null
+                    onClicked: technical.expanded = !technical.expanded
+                }
+
+                DankFlickable {
+                    id: technicalScroll
+                    objectName: "aurisSetupScroll"
+                    y: 40
                     width: parent.width
-                    height: controls.implicitHeight + Theme.spacingL * 2
-                    radius: Theme.cornerRadius
-                    color: Theme.floatingWindowNestedSurface
-                    border.color: Theme.outlineMedium
-                    border.width: Theme.layerOutlineWidth
+                    height: Math.min(contentHeight, 480, Math.max(0, popout.verticalBudget - 40 - quickControls.height - panelScroll.height - 40 - Theme.spacingS))
+                    // Retain the content during the closing reveal, too. Its
+                    // target contribution to implicitHeight is already zero.
+                    visible: technical.expanded || popout.height > technical.y + 40 + 0.5
+                    enabled: technical.expanded
+                    onVisibleChanged: if (!visible)
+                        contentY = 0
+                    contentWidth: width
+                    contentHeight: detailsColumn.implicitHeight
+                    clip: true
 
                     Column {
-                        id: controls
-
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingL
+                        id: detailsColumn
+                        width: technicalScroll.width
                         spacing: Theme.spacingM
+                        StyledText {
+                            text: "AirPods setup"
+                            font.pixelSize: Theme.fontSizeMedium
+                            font.weight: Font.Medium
+                            color: Theme.surfaceText
+                        }
+                        // URL loading also works when the live engine indexed this
+                        // directory before the settings component was installed.
+                        Loader {
+                            id: deviceSettings
+                            objectName: "aurisSettingsLoader"
 
-                        // In single mode DankButtonGroup only emits; it never writes
-                        // currentIndex itself, so this binding stays live.
-                        DankButtonGroup {
-                            model: ["Off", "ANC", "Transparency", "Adaptive"]
-                            currentIndex: root.noiseIndex
-                            selectionMode: "single"
-                            size: "small"
-                            enabled: root.connected
-                            onSelectionChanged: (index, selected) => {
-                                if (selected)
-                                    root.setNoise(root.noiseModes[index]);
+                            width: parent.width
+                            height: item ? item.implicitHeight : 0
+                            property int retrySerial: 0
+                            source: root.deviceSettingsUrl + "&retry=" + retrySerial
+                            function retryLoad() {
+                                source = "";
+                                retrySerial++;
+                                source = root.deviceSettingsUrl + "&retry=" + retrySerial;
+                            }
+                            function logComponentError() {
+                                // Loader exposes a status but no errorString(). A
+                                // component probe exposes the underlying QML error.
+                                const probe = Qt.createComponent(source, Component.PreferSynchronous);
+                                function report() {
+                                    if (probe.status === Component.Loading)
+                                        return;
+                                    console.error("auris: settings component diagnostic", source, probe.status, probe.errorString());
+                                    probe.destroy();
+                                }
+                                if (probe.status === Component.Loading)
+                                    probe.statusChanged.connect(report);
+                                else
+                                    report();
+                            }
+                            onStatusChanged: {
+                                if (status === Loader.Error) {
+                                    console.error("auris: device settings failed to load", source);
+                                    logComponentError();
+                                }
+                            }
+                            onLoaded: {
+                                item.available = Qt.binding(() => root.advancedAvailable && !root.advancedReadbackActive);
+                                item.unavailableReason = Qt.binding(() => root.advancedUnavailableReason);
+                                item.pendingRequests = Qt.binding(() => root.pendingAdvanced);
+                                item.deviceIdentity = Qt.binding(() => root.dev && typeof root.dev.address === "string" ? root.dev.address : "");
+                                item.deviceName = Qt.binding(() => root.confirmedDeviceName);
+                                item.microphone = Qt.binding(() => root.confirmedSetting("microphone"));
+                                item.pressSpeed = Qt.binding(() => root.confirmedSetting("press_speed"));
+                                item.holdDuration = Qt.binding(() => root.confirmedSetting("hold_duration"));
+                                item.listeningModeCycle = Qt.binding(() => root.confirmedSetting("listening_mode_cycle"));
+                                item.callControls = Qt.binding(() => root.confirmedSetting("call_controls"));
+                                item.personalizedVolume = Qt.binding(() => root.confirmedSetting("personalized_volume"));
+                                console.info("auris: device settings loaded", source);
+                            }
+
+                            Connections {
+                                target: deviceSettings.item
+
+                                function onRenameRequested(name) {
+                                    root.requestAdvancedRename(name);
+                                }
+                                function onSettingRequested(key, value) {
+                                    root.requestAdvancedSetting(key, value);
+                                }
                             }
                         }
 
                         Column {
+                            objectName: "aurisSettingsError"
                             width: parent.width
-                            spacing: Theme.spacingXS
-                            visible: root.noise === "adaptive"
+                            visible: deviceSettings.status !== Loader.Ready
+                            spacing: Theme.spacingS
 
                             StyledText {
-                                text: "Adaptive strength"
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.surfaceVariantText
-                            }
-
-                            DankSlider {
                                 width: parent.width
-                                minimum: 0
-                                maximum: 100
-                                step: 5
-                                unit: "%"
-                                value: root.adaptiveLevel
-                                enabled: root.connected
-                                leftIcon: "blur_on"
-                                onSliderDragFinished: finalValue => root.setAdaptiveLevel(finalValue)
+                                text: deviceSettings.status === Loader.Error ? "Device settings could not load. Retry below; details are in the shell log." : "Loading device settings…"
+                                wrapMode: Text.WordWrap
+                                color: Theme.warning
+                                font.pixelSize: Theme.fontSizeSmall
+                            }
+                            DankButton {
+                                objectName: "aurisSettingsRetry"
+                                width: parent.width
+                                visible: deviceSettings.status === Loader.Error
+                                text: "Retry device settings"
+                                onClicked: deviceSettings.retryLoad()
                             }
                         }
 
-                        DankToggle {
+                        StyledRect {
+                            id: technicalCard
                             width: parent.width
-                            height: 40
-                            text: "Conversational awareness"
-                            checked: root.ca
-                            enabled: root.connected && root.caKnown
-                            onToggled: isChecked => root.setConversationalAwareness(isChecked)
+                            height: technicalColumn.implicitHeight + Theme.spacingL * 2
+                            radius: Theme.cornerRadius
+                            color: Theme.floatingWindowNestedSurface
+
+                            Column {
+                                id: technicalColumn
+                                x: Theme.spacingL
+                                y: Theme.spacingL
+                                width: parent.width - Theme.spacingL * 2
+                                spacing: Theme.spacingM
+
+                                StyledText {
+                                    text: "Device & connection"
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    font.weight: Font.Medium
+                                    color: Theme.surfaceText
+                                }
+
+                                Repeater {
+                                    model: [
+                                        {
+                                            label: "Model",
+                                            value: root.model || "Not reported"
+                                        },
+                                        {
+                                            label: "Firmware",
+                                            value: root.firmware || "Not reported"
+                                        },
+                                        {
+                                            label: "Bluetooth",
+                                            value: !root.daemonUp ? "Unknown (daemon unavailable)" : root.connected ? "Connected" : "Disconnected"
+                                        },
+                                        {
+                                            label: "Control link",
+                                            value: root.daemonUp && root.advancedAapLinked ? "Ready (AAP)" : "Unavailable"
+                                        },
+                                        {
+                                            label: "Data source",
+                                            value: !root.daemonUp || root.source === "none" ? "No live source" : root.source.toUpperCase()
+                                        },
+                                        {
+                                            label: "Daemon",
+                                            value: root.daemonUp && root.st && root.st.daemon ? "aurisd " + root.st.daemon.version : "Unavailable"
+                                        },
+                                        {
+                                            label: "Settings API",
+                                            value: root.settingsApi >= 1 ? String(root.settingsApi) : "Not supported"
+                                        },
+                                        {
+                                            label: "UI revision",
+                                            value: root.uiRevision
+                                        },
+                                        {
+                                            label: "Last update",
+                                            value: root.ageText()
+                                        },
+                                        {
+                                            label: "Settings panel",
+                                            value: deviceSettings.status === Loader.Ready ? "Loaded" : deviceSettings.status === Loader.Error ? "Load failed" : "Loading"
+                                        }
+                                    ]
+                                    RowLayout {
+                                        required property var modelData
+                                        width: technicalColumn.width
+                                        spacing: Theme.spacingM
+                                        StyledText {
+                                            Layout.preferredWidth: 94
+                                            Layout.alignment: Qt.AlignTop
+                                            text: modelData.label
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.surfaceVariantText
+                                        }
+                                        StyledText {
+                                            Layout.fillWidth: true
+                                            text: modelData.value
+                                            wrapMode: Text.WrapAnywhere
+                                            font.pixelSize: Theme.fontSizeSmall
+                                            color: Theme.surfaceText
+                                        }
+                                    }
+                                }
+
+                                DankButton {
+                                    width: parent.width
+                                    enabled: root.daemonUp && root.connected
+                                    text: "Reconnect control link"
+                                    iconName: "refresh"
+                                    buttonHeight: 40
+                                    onClicked: root.reconnect()
+                                }
+                                StyledText {
+                                    width: parent.width
+                                    text: "Reopens Auris’s settings and telemetry link. Does not pair or reconnect Bluetooth audio."
+                                    wrapMode: Text.WordWrap
+                                    font.pixelSize: Theme.fontSizeSmall - 1
+                                    color: Theme.surfaceVariantText
+                                }
+                            }
+                        }
+
+                        // Keeps the final content clear of the fixed feedback
+                        // lane when the setup viewport is scrolled to its end.
+                        Item {
+                            width: 1
+                            height: technical.feedbackSlotHeight + Theme.spacingS
                         }
                     }
                 }
 
-                Column {
+                // This footer is allocated for the entire time setup is open.
+                // Status visibility and text never add or remove layout space.
+                Item {
+                    id: advancedFeedbackSlot
+                    objectName: "aurisAdvancedFeedbackSlot"
+                    y: 40 + Math.max(0, technicalScroll.height - height)
                     width: parent.width
-                    spacing: Theme.spacingXS
+                    height: technical.expanded ? technical.feedbackSlotHeight : 0
+                    clip: true
+                    z: 20
 
-                    StyledText {
-                        width: parent.width
-                        text: {
-                            const bits = [];
-                            if (root.model)
-                                bits.push(root.model);
-                            bits.push("via " + (root.source === "none" ? "no link" : root.source.toUpperCase()));
-                            return bits.join("  ·  ");
+                    StyledRect {
+                        id: advancedToast
+                        objectName: "aurisAdvancedToast"
+                        anchors.fill: parent
+                        opacity: root.advancedToastText.length > 0 ? 1 : 0
+                        enabled: opacity > 0
+                        radius: Theme.cornerRadius
+                        // Tint a neutral surface instead of putting surfaceText over a
+                        // saturated semantic colour; this remains legible in both DMS
+                        // light and dark palettes.
+                        color: root.advancedToastBackground(root.advancedToastKind)
+                        border.color: root.advancedToastAccent(root.advancedToastKind)
+                        border.width: Theme.layerOutlineWidth
+
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.AllButtons
+                            onWheel: event => event.accepted = true
                         }
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.surfaceVariantText
-                        elide: Text.ElideRight
-                    }
 
-                    StyledText {
-                        width: parent.width
-                        visible: root.firmware.length > 0
-                        text: "firmware " + root.firmware
-                        font.pixelSize: Theme.fontSizeSmall - 1
-                        color: Theme.surfaceVariantText
-                        elide: Text.ElideMiddle
+                        DankIcon {
+                            objectName: "aurisAdvancedToastIcon"
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.spacingM
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: root.advancedToastKind === "error" ? "error" : root.advancedToastKind === "warning" ? "warning" : root.advancedToastKind === "success" ? "check_circle" : "info"
+                            size: Theme.iconSizeSmall
+                            color: root.advancedToastAccent(root.advancedToastKind)
+                        }
+                        StyledText {
+                            objectName: "aurisAdvancedToastText"
+                            anchors.left: parent.left
+                            anchors.right: closeToast.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.leftMargin: Theme.spacingM * 2 + Theme.iconSizeSmall
+                            anchors.rightMargin: Theme.spacingS
+                            text: root.advancedToastText
+                            elide: Text.ElideRight
+                            maximumLineCount: 2
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceText
+                        }
+                        DankActionButton {
+                            id: closeToast
+                            objectName: "aurisDismissToast"
+                            anchors.right: parent.right
+                            anchors.rightMargin: Theme.spacingXS
+                            anchors.verticalCenter: parent.verticalCenter
+                            buttonSize: 28
+                            iconSize: 16
+                            iconName: "close"
+                            iconColor: Theme.surfaceText
+                            backgroundColor: "transparent"
+                            tooltipText: null
+                            onClicked: root.dismissAdvancedToast()
+                        }
+                        Rectangle {
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            height: 2
+                            width: parent.width * Math.max(0, root.advancedToastRemaining) / 50
+                            color: Theme.surfaceText
+                            opacity: 0.65
+                        }
                     }
-
-                    StyledText {
-                        text: root.ageText()
-                        font.pixelSize: Theme.fontSizeSmall - 1
-                        color: Theme.surfaceVariantText
-                    }
-                }
-
-                DankButton {
-                    visible: !root.connected
-                    text: "Reconnect"
-                    iconName: "refresh"
-                    buttonHeight: 34
-                    onClicked: root.reconnect()
                 }
             }
         }
@@ -870,7 +2103,7 @@ PluginComponent {
         return (pillLevel >= 0 ? pillLevel + "%  ·  " : "") + noiseLabel;
     }
     ccWidgetIsActive: connected && !stale
-    ccDetailHeight: 240
+    ccDetailHeight: 300
 
     onCcWidgetToggled: {
         if (connected)
@@ -881,28 +2114,30 @@ PluginComponent {
 
     ccDetailContent: Component {
         Rectangle {
-            implicitHeight: 240
+            // Fixed, because the host sizes this pane from ccDetailHeight and a
+            // Column that fills it cannot also measure it: the two bind in a
+            // circle and Qt breaks it by reporting nothing. Keep the two in step.
+            implicitHeight: root.ccDetailHeight
             radius: Theme.cornerRadius
             color: Theme.surfaceContainerHigh
 
             Column {
                 anchors.fill: parent
-                anchors.margins: Theme.spacingM
-                spacing: Theme.spacingS
+                anchors.margins: Theme.spacingL
+                spacing: Theme.spacingM
 
                 Column {
                     width: parent.width
-                    spacing: Theme.spacingXS
-                    opacity: root.stale ? 0.55 : 1
+                    spacing: Theme.spacingS
 
                     BatteryRow {
                         width: parent.width
                         label: "Left"
                         iconKind: "left"
                         level: root.level("left")
-                        charging: root.charging("left")
-                        caption: root.present("left") ? root.earCaption("left") : root.seenCaption("left", root.tick)
-                        dim: !root.present("left") || (root.connected && root.earOf("left") !== "in")
+                        charging: root.panelCharging("left")
+                        caption: root.cellCaption("left", root.tick)
+                        dim: root.cellDim("left")
                     }
 
                     BatteryRow {
@@ -910,9 +2145,9 @@ PluginComponent {
                         label: "Right"
                         iconKind: "right"
                         level: root.level("right")
-                        charging: root.charging("right")
-                        caption: root.present("right") ? root.earCaption("right") : root.seenCaption("right", root.tick)
-                        dim: !root.present("right") || (root.connected && root.earOf("right") !== "in")
+                        charging: root.panelCharging("right")
+                        caption: root.cellCaption("right", root.tick)
+                        dim: root.cellDim("right")
                     }
 
                     BatteryRow {
@@ -920,22 +2155,14 @@ PluginComponent {
                         label: "Case"
                         iconKind: "case"
                         level: root.level("case")
-                        charging: root.charging("case")
-                        caption: root.seenCaption("case", root.tick)
-                        dim: !root.present("case")
+                        charging: root.panelCharging("case")
+                        caption: root.cellCaption("case", root.tick)
+                        dim: root.cellDim("case")
                     }
                 }
 
-                DankButtonGroup {
-                    model: ["Off", "ANC", "Transparency", "Adaptive"]
-                    currentIndex: root.noiseIndex
-                    selectionMode: "single"
-                    size: "small"
-                    enabled: root.connected
-                    onSelectionChanged: (index, selected) => {
-                        if (selected)
-                            root.setNoise(root.noiseModes[index]);
-                    }
+                NoiseSegments {
+                    width: parent.width
                 }
 
                 StyledText {
@@ -948,5 +2175,4 @@ PluginComponent {
             }
         }
     }
-
 }

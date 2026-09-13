@@ -14,6 +14,7 @@ use std::{
 use aurisd::{
     config,
     ctl_proto::{Request, Response},
+    settings::{self, SettingCommand},
     state::{Cell, NoiseControl, NoiseControlMode, Snapshot, Source},
 };
 use clap::{Parser, Subcommand, ValueEnum};
@@ -27,7 +28,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Control the aurisd daemon.
 #[derive(Parser, Debug)]
-#[command(version, about = "control aurisd: noise modes, conversational awareness, status", long_about = None)]
+#[command(
+    version,
+    about = "control aurisd: AirPods status and settings",
+    long_about = None,
+    after_help = "Settings use JSON values, for example:\n  auris setting microphone '\"left\"'\n  auris setting personalized_volume true\n  auris setting listening_mode_cycle '[\"anc\",\"transparency\"]'\n\nconnect-once is explicit and can transfer audio away from another host; it is never triggered automatically."
+)]
 struct Cli {
     /// Override the runtime directory (default `$XDG_RUNTIME_DIR/aurisd`).
     #[arg(long, global = true, value_name = "PATH")]
@@ -57,6 +63,22 @@ enum Cmd {
     },
     /// Drop and re-establish the AAP link.
     Reconnect,
+    /// Ask BlueZ once to connect the pinned paired device. This may transfer
+    /// audio from another host; it never retries automatically.
+    ConnectOnce,
+    /// Rename the AirPods accessory.
+    Rename {
+        /// New accessory name (quote names containing spaces).
+        name: String,
+    },
+    /// Set a typed AirPods setting using a JSON value.
+    Setting {
+        /// Setting key, such as microphone or personalized_volume.
+        key: String,
+        /// JSON string, boolean, or array appropriate for the key.
+        #[arg(value_name = "JSON_VALUE")]
+        value: String,
+    },
     /// Show the current state.
     Status {
         /// Print the raw state.json object instead of a summary.
@@ -95,17 +117,9 @@ fn main() -> ExitCode {
     let dir = config::runtime_dir(cli.runtime_dir.as_deref());
     let path = config::socket_path(&dir);
 
-    let (request, wants_json) = match cli.command {
-        Cmd::Noise { mode } => (Request::SetNoiseControl { value: mode.into() }, false),
-        Cmd::Ca { state } => (
-            Request::SetConversationalAwareness {
-                value: matches!(state, OnOff::On),
-            },
-            false,
-        ),
-        Cmd::Adaptive { level } => (Request::SetAdaptiveLevel { value: level }, false),
-        Cmd::Reconnect => (Request::Reconnect, false),
-        Cmd::Status { json } => (Request::Status, json),
+    let (request, wants_json, notice) = match request_from_command(cli.command) {
+        Ok(parsed) => parsed,
+        Err(e) => return fail(e, EXIT_DAEMON_ERROR),
     };
 
     let response = match talk(&path, &request) {
@@ -114,7 +128,12 @@ fn main() -> ExitCode {
     };
 
     match response {
-        Response::Ack { ok: true, .. } => ExitCode::SUCCESS,
+        Response::Ack { ok: true, .. } => {
+            if let Some(message) = notice {
+                println!("{message}");
+            }
+            ExitCode::SUCCESS
+        }
         Response::Ack { ok: false, error } => fail(
             error.as_deref().unwrap_or("command failed"),
             EXIT_DAEMON_ERROR,
@@ -136,6 +155,47 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Convert CLI input into a fully validated request before opening the socket.
+fn request_from_command(command: Cmd) -> Result<(Request, bool, Option<&'static str>), String> {
+    let parsed = match command {
+        Cmd::Noise { mode } => (Request::SetNoiseControl { value: mode.into() }, false),
+        Cmd::Ca { state } => (
+            Request::SetConversationalAwareness {
+                value: matches!(state, OnOff::On),
+            },
+            false,
+        ),
+        Cmd::Adaptive { level } => (Request::SetAdaptiveLevel { value: level }, false),
+        Cmd::Reconnect => (Request::Reconnect, false),
+        Cmd::ConnectOnce => (Request::ConnectOnce, false),
+        Cmd::Rename { name } => {
+            settings::validate_name(&name)?;
+            return Ok((
+                Request::Rename { name },
+                false,
+                Some("sent; AirPods metadata may not refresh until reconnect"),
+            ));
+        }
+        Cmd::Setting { key, value } => {
+            let value: serde_json::Value = serde_json::from_str(&value)
+                .map_err(|e| format!("invalid JSON value for {key}: {e}"))?;
+            let setting: SettingCommand = serde_json::from_value(serde_json::json!({
+                "key": key,
+                "value": value,
+            }))
+            .map_err(|e| format!("invalid setting: {e}"))?;
+            setting.validate()?;
+            return Ok((
+                Request::SetSetting { setting },
+                false,
+                Some("sent; waiting for AirPods to report the setting"),
+            ));
+        }
+        Cmd::Status { json } => (Request::Status, json),
+    };
+    Ok((parsed.0, parsed.1, None))
 }
 
 /// Report a failure on both streams and return its exit code.
@@ -240,5 +300,129 @@ fn summary(s: &Snapshot) -> String {
             Source::None => "none",
         }
     ));
+    if s.settings_api == 0 {
+        out.push_str("settings: unavailable (older daemon)\n");
+    } else {
+        let settings = serde_json::to_value(&s.settings).unwrap_or_default();
+        let object = settings.as_object();
+        out.push_str("settings:");
+        for key in [
+            "microphone",
+            "press_speed",
+            "hold_duration",
+            "listening_mode_cycle",
+            "call_controls",
+            "personalized_volume",
+        ] {
+            let value = object
+                .and_then(|values| values.get(key))
+                .filter(|value| !value.is_null())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown".to_owned());
+            out.push_str(&format!("\n  {key}: {value}"));
+        }
+        out.push('\n');
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Cmd {
+        Cli::try_parse_from(args).unwrap().command
+    }
+
+    fn request(args: &[&str]) -> Result<Request, String> {
+        request_from_command(command(args)).map(|(request, _, _)| request)
+    }
+
+    #[test]
+    fn rename_validates_utf8_bytes_and_controls_before_transport() {
+        let at_limit = format!("{}a", "é".repeat(127));
+        assert!(matches!(
+            request(&["auris", "rename", &at_limit]),
+            Ok(Request::Rename { name }) if name == at_limit
+        ));
+
+        let too_long = "é".repeat(128);
+        assert!(request(&["auris", "rename", &too_long]).is_err());
+        assert!(request(&["auris", "rename", "   "]).is_err());
+        assert!(request(&["auris", "rename", "bad\nname"]).is_err());
+
+        let shell_like = "$(touch /tmp/auris-must-not-run)";
+        assert!(matches!(
+            request(&["auris", "rename", shell_like]),
+            Ok(Request::Rename { name }) if name == shell_like
+        ));
+    }
+
+    #[test]
+    fn setting_accepts_typed_json_values() {
+        for args in [
+            ["auris", "setting", "microphone", "\"left\""],
+            ["auris", "setting", "press_speed", "\"slower\""],
+            ["auris", "setting", "hold_duration", "\"shortest\""],
+            [
+                "auris",
+                "setting",
+                "call_controls",
+                "\"mute_once_hangup_twice\"",
+            ],
+            ["auris", "setting", "personalized_volume", "true"],
+            [
+                "auris",
+                "setting",
+                "listening_mode_cycle",
+                "[\"anc\",\"transparency\"]",
+            ],
+        ] {
+            assert!(matches!(request(&args), Ok(Request::SetSetting { .. })));
+        }
+    }
+
+    #[test]
+    fn setting_rejects_malformed_or_wrong_json_types() {
+        for args in [
+            ["auris", "setting", "microphone", "left"],
+            ["auris", "setting", "microphone", "\"middle\""],
+            ["auris", "setting", "personalized_volume", "\"true\""],
+            ["auris", "setting", "listening_mode_cycle", "\"anc\""],
+            ["auris", "setting", "listening_mode_cycle", "[]"],
+            [
+                "auris",
+                "setting",
+                "listening_mode_cycle",
+                "[\"anc\",\"anc\"]",
+            ],
+            ["auris", "setting", "not_a_setting", "true"],
+        ] {
+            assert!(request(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn existing_commands_still_parse() {
+        assert!(matches!(
+            request(&["auris", "noise", "anc"]),
+            Ok(Request::SetNoiseControl {
+                value: NoiseControlMode::Anc
+            })
+        ));
+        assert!(matches!(request(&["auris", "status"]), Ok(Request::Status)));
+        assert!(matches!(
+            request(&["auris", "connect-once"]),
+            Ok(Request::ConnectOnce)
+        ));
+    }
+
+    #[test]
+    fn setting_request_uses_the_flattened_wire_shape() {
+        let request = request(&["auris", "setting", "microphone", "\"right\""]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"cmd":"set_setting","key":"microphone","value":"right"}"#
+        );
+    }
 }

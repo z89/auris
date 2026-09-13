@@ -55,10 +55,10 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cfg = Config::load().unwrap_or_else(|e| {
-        warn!(error = %e, "ignoring unreadable config file");
-        Config::default()
-    });
+    // Dropping malformed configuration could silently discard a pinned
+    // identity or safety policy. Missing files still load safe defaults.
+    let cfg = Config::load().context("loading aurisd configuration")?;
+    cfg.ble.validate().context("validating BLE configuration")?;
 
     let pinned_str = args.device.or(cfg.device);
     let pinned = match pinned_str.as_deref() {
@@ -78,7 +78,10 @@ async fn main() -> anyhow::Result<()> {
     // path missing, even when no accessory has ever connected.
     let mut initial = Snapshot::initial(&pinned.map(|a| a.to_string()).unwrap_or_default());
     let cache_path = aurisd::cache::cache_path();
-    if let Some(battery) = cache_path.as_deref().and_then(aurisd::cache::load) {
+    if let Some(battery) = cache_path
+        .as_deref()
+        .and_then(|path| aurisd::cache::load(path, &initial.device.address))
+    {
         info!(case = ?battery.case.level, "restored last known battery levels");
         initial.battery = battery;
     }
@@ -100,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(ctl_server::serve(listener, Arc::clone(&store), cmd_tx));
     tokio::spawn(bluez::run(link_tx, pinned));
+    tokio::spawn(aurisd::ble::run(Arc::clone(&store), cfg.ble, pinned));
     tokio::spawn(
         Supervisor::new(
             Arc::clone(&store),
@@ -117,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
     // state synchronously: the link is gone and the batteries are stale.
     // `device.connected` keeps whatever BlueZ last said.
     store.apply(Update::AapLink(false));
+    // No observer survives process exit. Retain BLE readings as history, not
+    // live observations in the final state file.
+    store.apply(Update::ExpireBle {
+        before: "9999-12-31T23:59:59Z".into(),
+    });
     let final_snapshot = store.snapshot();
     if let Err(e) = writer::write_atomic(&state_path, &final_snapshot) {
         warn!(path = %state_path.display(), error = %e, "failed to write final state.json");

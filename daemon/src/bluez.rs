@@ -33,6 +33,9 @@ pub enum LinkEvent {
         name: Option<String>,
         /// Uppercase hex product id from the DID modalias, if known.
         model_id: Option<String>,
+        /// Whether the watcher selected this address from an explicit pin.
+        /// This is only authority for an explicitly armed `connect-once`.
+        pinned: bool,
     },
     /// BlueZ `Connected` for the classic link.
     Connected(bool),
@@ -110,6 +113,7 @@ async fn once(tx: &mpsc::Sender<LinkEvent>, pinned: Option<Address>) -> bluer::R
             address,
             name,
             model_id,
+            pinned: pinned.is_some(),
         })
         .await;
 
@@ -132,6 +136,7 @@ async fn once(tx: &mpsc::Sender<LinkEvent>, pinned: Option<Address>) -> bluer::R
                     DeviceProperty::Name(n) => {
                         let _ = tx.send(LinkEvent::Identity {
                             adapter: adapter_addr, address, name: Some(n), model_id: None,
+                            pinned: pinned.is_some(),
                         }).await;
                     }
                     DeviceProperty::Modalias(m) => {
@@ -139,6 +144,7 @@ async fn once(tx: &mpsc::Sender<LinkEvent>, pinned: Option<Address>) -> bluer::R
                             .then(|| models::model_id(m.product));
                         let _ = tx.send(LinkEvent::Identity {
                             adapter: adapter_addr, address, name: None, model_id,
+                            pinned: pinned.is_some(),
                         }).await;
                     }
                     other => debug!(?other, "ignored device property"),
@@ -166,4 +172,48 @@ async fn once(tx: &mpsc::Sender<LinkEvent>, pinned: Option<Address>) -> bluer::R
             }
         }
     }
+}
+
+/// Re-read BlueZ immediately before an AAP dial.
+///
+/// L2CAP `connect()` can make the kernel establish an ACL.  The watcher event
+/// is therefore only a hint: callers must require a fresh local `Connected`
+/// read for the same adapter and device before opening the AAP PSM.  This
+/// helper never calls `Device1.Connect`.
+pub async fn locally_connected(
+    adapter_address: Address,
+    device_address: Address,
+) -> bluer::Result<bool> {
+    let session = Session::new().await?;
+    for name in session.adapter_names().await? {
+        let adapter = session.adapter(&name)?;
+        if adapter.address().await? != adapter_address {
+            continue;
+        }
+        let device = adapter.device(device_address)?;
+        return Ok(device.is_paired().await? && device.is_connected().await?);
+    }
+    Ok(false)
+}
+
+/// Resolve the paired pinned device without a connection side effect. Return
+/// its handle so the supervisor can recheck command authority after these
+/// asynchronous lookups, immediately before issuing `Device1.Connect`.
+pub async fn paired_device(
+    adapter_address: Address,
+    device_address: Address,
+) -> bluer::Result<Option<Device>> {
+    let session = Session::new().await?;
+    for name in session.adapter_names().await? {
+        let adapter = session.adapter(&name)?;
+        if adapter.address().await? != adapter_address {
+            continue;
+        }
+        let device = adapter.device(device_address)?;
+        if !device.is_paired().await? {
+            return Ok(None);
+        }
+        return Ok(Some(device));
+    }
+    Ok(None)
 }

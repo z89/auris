@@ -65,6 +65,7 @@ pub fn write_atomic(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
 /// has been dropped.
 pub async fn run(mut rx: watch::Receiver<Snapshot>, path: PathBuf, cache: Option<PathBuf>) {
     let mut cached: Option<crate::state::Battery> = None;
+    let mut cached_address = String::new();
     while rx.changed().await.is_ok() {
         // Coalesce whatever else arrives inside the debounce window.
         tokio::time::sleep(DEBOUNCE).await;
@@ -74,14 +75,18 @@ pub async fn run(mut rx: watch::Receiver<Snapshot>, path: PathBuf, cache: Option
             Err(e) => warn!(path = %path.display(), error = %e, "failed to write state.json"),
         }
         let Some(cache_path) = &cache else { continue };
-        if cached
-            .as_ref()
-            .is_some_and(|c| crate::cache::same_readings(c, &snap.battery))
+        if cached_address == snap.device.address
+            && cached
+                .as_ref()
+                .is_some_and(|c| crate::cache::same_readings(c, &snap.battery))
         {
             continue;
         }
-        match crate::cache::save(cache_path, &snap.battery) {
-            Ok(()) => cached = Some(snap.battery.clone()),
+        match crate::cache::save(cache_path, &snap.device.address, &snap.battery) {
+            Ok(()) => {
+                cached = Some(snap.battery.clone());
+                cached_address = snap.device.address.clone();
+            }
             Err(e) => {
                 warn!(path = %cache_path.display(), error = %e, "failed to write battery cache")
             }

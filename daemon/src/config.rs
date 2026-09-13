@@ -5,14 +5,19 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Which physical bud the accessory calls "primary" in an ear-detection
-/// packet. v0.1 assumes left; the contract's 0x0006 payload does not say.
+/// packet. The 0x0006 payload never says, and it is not a fixed property of the
+/// hardware: whichever bud is doing the work becomes primary, so it changes
+/// when you put one bud away. Pinning it to a side is therefore wrong half the
+/// time, which is why [`PrimaryBud::Auto`] is the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrimaryBud {
-    /// Primary byte describes the left bud.
+    /// Work it out from which buds are out of the case. See `store::mutate`.
     #[default]
+    Auto,
+    /// Primary byte always describes the left bud.
     Left,
-    /// Primary byte describes the right bud.
+    /// Primary byte always describes the right bud.
     Right,
 }
 
@@ -24,6 +29,8 @@ pub struct Config {
     pub device: Option<String>,
     /// Which bud the primary byte of an ear-detection packet describes.
     pub primary_bud: PrimaryBud,
+    /// Opt-in bounded BLE battery observation (requires private identity keys).
+    pub ble: crate::ble::BleConfig,
 }
 
 impl Config {
@@ -134,6 +141,6 @@ mod tests {
     fn empty_config_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.device.is_none());
-        assert_eq!(cfg.primary_bud, PrimaryBud::Left);
+        assert_eq!(cfg.primary_bud, PrimaryBud::Auto);
     }
 }

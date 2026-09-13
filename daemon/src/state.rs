@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::settings::{CallControls, DeviceSettings, HoldDuration, MicrophoneMode, PressSpeed};
+
 /// state.json schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -16,7 +18,7 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum Source {
     /// Apple Accessory Protocol over an L2CAP link.
     Aap,
-    /// Passive BLE proximity-pairing adverts (v0.2).
+    /// Identity-matched BLE proximity adverts (opt-in discovery).
     Ble,
     /// Nothing is connected; values are last-known.
     #[default]
@@ -158,12 +160,22 @@ pub struct DeviceInfo {
 /// One battery cell.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cell {
+    /// Source of the most recent retained measurement, not audio ownership.
+    #[serde(default)]
+    pub source: Source,
+    /// This cell has a current observation. A link opening alone is not one.
+    #[serde(default)]
+    pub fresh: bool,
     /// 0-100, or `null` when never seen. When `present` is false this is the
     /// last level the component reported, so a case that dropped out of range
     /// can still be shown dimmed.
     pub level: Option<u8>,
     /// Whether the cell is charging. Always false when not present.
     pub charging: bool,
+    /// Charging state from the last live reading, including for absent cells.
+    /// `null` means no live charging state has ever been observed.
+    #[serde(default)]
+    pub last_known_charging: Option<bool>,
     /// Whether the component is reporting right now.
     pub present: bool,
     /// RFC3339 time of the last live reading, `null` if never seen.
@@ -216,6 +228,16 @@ pub struct Snapshot {
     pub conversational_awareness: Option<bool>,
     /// Adaptive transparency level, `null` when unknown.
     pub adaptive_level: Option<u8>,
+    /// Version of the additive settings API. Missing in older snapshots.
+    #[serde(default)]
+    pub settings_api: u32,
+    /// Accessory-confirmed settings. Values are unknown until an AAP echo.
+    #[serde(default)]
+    pub settings: DeviceSettings,
+    /// Per-setting accessory report counters. Increment even for an unchanged
+    /// value, so unrelated battery snapshots cannot be mistaken for an echo.
+    #[serde(default)]
+    pub settings_report_seq: std::collections::BTreeMap<String, u64>,
 }
 
 impl Default for Snapshot {
@@ -234,6 +256,9 @@ impl Default for Snapshot {
             noise_control: NoiseControl::Unknown,
             conversational_awareness: None,
             adaptive_level: None,
+            settings_api: 1,
+            settings: DeviceSettings::default(),
+            settings_report_seq: Default::default(),
         }
     }
 }
@@ -274,20 +299,29 @@ impl Snapshot {
             battery: Battery {
                 stale: false,
                 left: Cell {
+                    source: Source::Aap,
+                    fresh: true,
                     level: Some(87),
                     charging: false,
+                    last_known_charging: Some(false),
                     present: true,
                     last_seen: Some(now.clone()),
                 },
                 right: Cell {
+                    source: Source::Aap,
+                    fresh: true,
                     level: Some(85),
                     charging: false,
+                    last_known_charging: Some(false),
                     present: true,
                     last_seen: Some(now.clone()),
                 },
                 case: Cell {
+                    source: Source::Aap,
+                    fresh: true,
                     level: Some(62),
                     charging: true,
+                    last_known_charging: Some(true),
                     present: true,
                     last_seen: Some(now),
                 },
@@ -300,6 +334,20 @@ impl Snapshot {
             noise_control: NoiseControl::Anc,
             conversational_awareness: Some(false),
             adaptive_level: Some(50),
+            settings_api: 1,
+            settings: DeviceSettings {
+                microphone: Some(MicrophoneMode::Auto),
+                press_speed: Some(PressSpeed::Default),
+                hold_duration: Some(HoldDuration::Default),
+                listening_mode_cycle: Some(vec![
+                    NoiseControlMode::Anc,
+                    NoiseControlMode::Transparency,
+                    NoiseControlMode::Adaptive,
+                ]),
+                call_controls: Some(CallControls::MuteOnceHangupTwice),
+                personalized_volume: Some(true),
+            },
+            settings_report_seq: Default::default(),
         }
     }
 }
@@ -329,6 +377,9 @@ mod tests {
                 "lid",
                 "noise_control",
                 "schema",
+                "settings",
+                "settings_api",
+                "settings_report_seq",
                 "updated_at",
             ]
         );
@@ -379,7 +430,18 @@ mod tests {
             .map(String::as_str)
             .collect();
         cell_keys.sort_unstable();
-        assert_eq!(cell_keys, ["charging", "last_seen", "level", "present"]);
+        assert_eq!(
+            cell_keys,
+            [
+                "charging",
+                "fresh",
+                "last_known_charging",
+                "last_seen",
+                "level",
+                "present",
+                "source"
+            ]
+        );
 
         let mut ear_keys: Vec<&str> = obj["ear"]
             .as_object()
@@ -394,10 +456,14 @@ mod tests {
         assert_eq!(json["daemon"]["source"], "aap");
         assert_eq!(json["device"]["model_id"], "201B");
         assert_eq!(json["battery"]["left"]["level"], 87);
+        assert_eq!(json["battery"]["left"]["last_known_charging"], false);
         assert_eq!(json["ear"]["left"], "in");
         assert_eq!(json["ear"]["right"], "out");
         assert_eq!(json["noise_control"], "anc");
         assert_eq!(json["lid"], "unknown");
+        assert_eq!(json["settings_api"], 1);
+        assert_eq!(json["settings"]["microphone"], "auto");
+        assert_eq!(json["settings"]["call_controls"], "mute_once_hangup_twice");
 
         let back: Snapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snap);
@@ -408,9 +474,12 @@ mod tests {
         let snap = Snapshot::initial("AC:DE:48:00:11:22");
         let json = serde_json::to_value(&snap).unwrap();
         assert!(json["battery"]["left"]["level"].is_null());
+        assert!(json["battery"]["left"]["last_known_charging"].is_null());
         assert!(json["device"]["model"].is_null());
         assert!(json["conversational_awareness"].is_null());
         assert!(json["adaptive_level"].is_null());
+        assert_eq!(json["settings_api"], 1);
+        assert!(json["settings"]["microphone"].is_null());
         assert_eq!(json["battery"]["stale"], true);
         assert_eq!(json["device"]["connected"], false);
         assert_eq!(json["daemon"]["source"], "none");
@@ -427,5 +496,44 @@ mod tests {
             Some(NoiseControlMode::Anc)
         );
         assert_eq!(NoiseControlMode::from_wire(0x09), None);
+    }
+
+    #[test]
+    fn old_snapshot_defaults_the_additive_settings_fields() {
+        let mut json = serde_json::to_value(Snapshot::example()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("settings_api");
+        obj.remove("settings");
+
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snapshot.settings_api, 0);
+        assert_eq!(snapshot.settings, DeviceSettings::default());
+    }
+
+    #[test]
+    fn old_snapshot_defaults_missing_charging_history() {
+        let mut json = serde_json::to_value(Snapshot::example()).unwrap();
+        for name in ["left", "right", "case"] {
+            json["battery"][name]
+                .as_object_mut()
+                .unwrap()
+                .remove("last_known_charging");
+        }
+
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snapshot.battery.left.last_known_charging, None);
+        assert_eq!(snapshot.battery.right.last_known_charging, None);
+        assert_eq!(snapshot.battery.case.last_known_charging, None);
+    }
+
+    #[test]
+    fn partial_settings_object_defaults_missing_fields() {
+        let mut json = serde_json::to_value(Snapshot::example()).unwrap();
+        json["settings"] = serde_json::json!({ "microphone": "left" });
+
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snapshot.settings.microphone, Some(MicrophoneMode::Left));
+        assert_eq!(snapshot.settings.press_speed, None);
+        assert_eq!(snapshot.settings.call_controls, None);
     }
 }

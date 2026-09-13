@@ -2,7 +2,8 @@
 //!
 //! This module owns the only AAP socket and never parses bytes itself: every
 //! packet goes through [`crate::aap::codec`]. It reacts to BlueZ link events
-//! and to control commands, and it never initiates a Bluetooth connection.
+//! and control commands. L2CAP dialing is guarded because it can cause the
+//! kernel to establish an ACL connection.
 
 use std::{sync::Arc, time::Duration};
 
@@ -19,10 +20,11 @@ use crate::{
         opcode,
         socket::{self, AapSocket, Link},
     },
-    bluez::LinkEvent,
+    bluez::{self, LinkEvent},
     ctl_proto::{Request, Response},
     ctl_server::Command,
-    store::{Store, Update},
+    state::Snapshot,
+    store::{ConnectionContext, Store, Update},
 };
 
 /// Settle time after `Connected=true` before dialing the PSM.
@@ -38,14 +40,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Give up on an L2CAP `send()` after this long; a stalled peer must not
 /// freeze the select loop.
 const SEND_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Backoff ladder in seconds, ±20% jitter, capped at the last entry.
-const BACKOFF_SECS: [u64; 7] = [1, 2, 4, 8, 15, 30, 60];
-/// A session that lasted this long resets the failure streak.
-const SURVIVED: Duration = Duration::from_secs(30);
-/// Recycles allowed inside one `Connected` period before slow polling.
-const MAX_RECYCLES: u32 = 3;
-/// Slow-poll interval once the recycle budget is spent.
-const SLOW_POLL: Duration = Duration::from_secs(300);
 /// No battery packet within this long after the handshake is suspicious.
 const BATTERY_WATCHDOG: Duration = Duration::from_secs(10);
 /// How many times to re-send request-notifications before recycling.
@@ -100,16 +94,6 @@ impl SessionConfig {
     }
 }
 
-/// Deterministic ±20% jitter without pulling in an RNG crate.
-fn jitter(base: Duration) -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    // 0..=40 -> -20%..=+20%
-    let pct = 80 + (nanos % 41);
-    Duration::from_millis(base.as_millis() as u64 * pct / 100)
-}
-
 enum Wake {
     Link(LinkEvent),
     Cmd(Command),
@@ -126,13 +110,18 @@ pub struct Supervisor {
 
     adapter: Option<Address>,
     device: Option<Address>,
+    /// True only when the watcher selected this identity from an explicit pin.
+    pinned: bool,
     acl: bool,
     sock: Option<Arc<Link>>,
 
     dial_at: Option<Instant>,
-    backoff_idx: usize,
-    recycles: u32,
-    session_start: Option<Instant>,
+    dial_kind: Option<DialKind>,
+    /// Invalidates a dial or handshake when the selected link changes.
+    link_generation: u64,
+    /// Ambiguous peer loss can mean handoff to another host. Suppression lasts
+    /// until a genuine new local false->true link observation.
+    auto_suppressed: bool,
     handshake_at: Option<Instant>,
     last_packet: Option<Instant>,
     battery_seen: bool,
@@ -188,6 +177,17 @@ enum AckWait {
     TimedOut,
     /// The socket failed or the peer hung up.
     Failed(std::io::Error),
+    /// BlueZ changed identity or link state while the opening sequence ran.
+    Cancelled,
+}
+
+/// Why the sole permitted dial in the current state was armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialKind {
+    /// One attempt following an observed local `Connected: false -> true`.
+    Automatic,
+    /// One attempt explicitly rearmed by a user command.
+    Manual,
 }
 
 /// What the idle watchdog wants done, given the clock and the two timestamps.
@@ -230,25 +230,51 @@ fn idle_decision(
     }
 }
 
-/// Send one packet, failing rather than blocking forever on a stalled peer.
-fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn settings_model_error(snapshot: &Snapshot) -> Option<String> {
+    match snapshot.device.model_id.as_str() {
+        "201B" => None,
+        "" => Some(
+            "device model is unknown; settings and rename require AirPods 4 (ANC) model 201B"
+                .into(),
+        ),
+        model => Some(format!(
+            "unsupported device model {model}; settings and rename require AirPods 4 (ANC) model 201B"
+        )),
+    }
 }
 
-async fn send_timed(sock: &Link, packet: &[u8]) -> std::io::Result<()> {
-    trace!(tx = %hex(packet), "AAP send");
+async fn send_timed(sock: &impl AapSocket, packet: &[u8]) -> std::io::Result<()> {
+    trace!(len = packet.len(), "AAP send");
     match tokio::time::timeout(SEND_TIMEOUT, sock.send(packet)).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(sent)) if sent == packet.len() => Ok(()),
+        Ok(Ok(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "AAP datagram was not sent in full",
+        )),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "AAP send timed out after 1500 ms",
         )),
     }
+}
+
+// The target's live trace contains setup writes but no corresponding echoes.
+// Ask for reports once, on the same socket, using the existing subscription
+// packet. This is a readback candidate, not confirmation, and never retries
+// the setting write. Hardware validation must establish whether it helps.
+async fn send_setting_and_refresh(sock: &impl AapSocket, packet: &[u8]) -> std::io::Result<()> {
+    send_timed(sock, packet).await?;
+    debug!(
+        bytes = packet.len(),
+        "AirPods setting datagram sent; awaiting report"
+    );
+    if let Err(error) = send_timed(sock, &codec::encode_request_notifications()).await {
+        // The setting was already sent. Reporting its write as failed could
+        // encourage a duplicate; keep it unconfirmed and log the refresh error.
+        warn!(%error, "setting sent but notification refresh failed; not retrying");
+    }
+    Ok(())
 }
 
 impl Supervisor {
@@ -266,12 +292,13 @@ impl Supervisor {
             cmd_rx,
             adapter: None,
             device: None,
+            pinned: false,
             acl: false,
             sock: None,
             dial_at: None,
-            backoff_idx: 0,
-            recycles: 0,
-            session_start: None,
+            dial_kind: None,
+            link_generation: 0,
+            auto_suppressed: false,
             handshake_at: None,
             last_packet: None,
             battery_seen: false,
@@ -308,12 +335,12 @@ impl Supervisor {
                 Wake::Link(ev) => self.on_link(ev),
                 Wake::Cmd(cmd) => self.on_command(cmd).await,
                 Wake::Recv(Ok(bytes)) if bytes.is_empty() => {
-                    self.recycle("peer closed the AAP socket").await;
+                    self.suppress_automatic("peer closed the AAP socket");
                 }
                 Wake::Recv(Ok(bytes)) => self.on_packet(&bytes),
                 Wake::Recv(Err(e)) => {
                     warn!(error = %e, errno = ?e.raw_os_error(), "AAP recv failed");
-                    self.recycle("recv error").await;
+                    self.suppress_automatic("recv error");
                 }
                 Wake::Tick => self.on_tick().await,
             }
@@ -327,7 +354,22 @@ impl Supervisor {
                 address,
                 name,
                 model_id,
+                pinned,
             } => {
+                let changed = self.adapter != Some(adapter)
+                    || self.device != Some(address)
+                    || self.pinned != pinned;
+                if changed {
+                    // A new identity has no authority inherited from the old
+                    // one. In-flight opening work observes this generation.
+                    self.link_generation = self.link_generation.wrapping_add(1);
+                    self.acl = false;
+                    self.pinned = pinned;
+                    self.dial_at = None;
+                    self.dial_kind = None;
+                    self.drop_socket();
+                    self.store.apply(Update::AclConnected(false));
+                }
                 self.adapter = Some(adapter);
                 self.device = Some(address);
                 self.store.apply(Update::Identity {
@@ -340,16 +382,23 @@ impl Supervisor {
                 self.store.apply(Update::AclConnected(true));
                 if !self.acl {
                     self.acl = true;
-                    self.recycles = 0;
-                    self.backoff_idx = 0;
                     self.dial_attempt = 0;
-                    self.dial_at = Some(Instant::now() + SETTLE);
-                    info!("device connected; dialing AAP after settle");
+                    self.link_generation = self.link_generation.wrapping_add(1);
+                    // A real false->true observation begins a new local-link
+                    // period. It is the only automatic rearm signal.
+                    self.auto_suppressed = false;
+                    self.arm_dial(DialKind::Automatic, SETTLE);
+                    info!("device connected locally; one guarded AAP attempt armed");
                 }
             }
             LinkEvent::Connected(false) | LinkEvent::AdapterGone => {
+                let changed = self.acl || self.adapter.is_some();
                 self.acl = false;
                 self.dial_at = None;
+                self.dial_kind = None;
+                if changed {
+                    self.link_generation = self.link_generation.wrapping_add(1);
+                }
                 self.drop_socket();
                 self.store.apply(Update::AclConnected(false));
             }
@@ -357,31 +406,187 @@ impl Supervisor {
     }
 
     fn drop_socket(&mut self) {
-        if self.sock.take().is_some() {
-            self.store.apply(Update::AapLink(false));
-        }
+        self.sock.take();
+        // Opening packets can arrive before a socket is promoted into `sock`.
+        // Always invalidate AAP-derived state when that tentative opening ends.
+        self.store.apply(Update::AapLink(false));
         self.handshake_at = None;
-        self.session_start = None;
         self.battery_seen = false;
         self.notif_resends = 0;
         self.idle_probe_at = None;
     }
 
+    fn arm_dial(&mut self, kind: DialKind, delay: Duration) {
+        self.dial_kind = Some(kind);
+        self.dial_at = Some(Instant::now() + delay);
+    }
+
+    /// Stop unattended recovery for this local-link period. A vanished peer,
+    /// failed write, or unanswered watchdog cannot distinguish a reset from a
+    /// host handoff, so retrying might reclaim audio from that other host.
+    fn suppress_automatic(&mut self, reason: &str) {
+        warn!(
+            reason,
+            "AAP recovery suppressed until a new local link observation or explicit command"
+        );
+        self.auto_suppressed = true;
+        self.dial_at = None;
+        self.dial_kind = None;
+        self.drop_socket();
+    }
+
+    async fn fresh_local_connected(&self) -> Result<bool, String> {
+        let (Some(adapter), Some(device)) = (self.adapter, self.device) else {
+            return Err("selected Bluetooth device is not known yet".into());
+        };
+        match tokio::time::timeout(CONNECT_TIMEOUT, bluez::locally_connected(adapter, device)).await
+        {
+            Ok(Ok(connected)) => Ok(connected),
+            Ok(Err(e)) => Err(format!("could not verify BlueZ local Connected state: {e}")),
+            Err(_) => Err("timed out verifying BlueZ local Connected state".into()),
+        }
+    }
+
+    /// Consume a fresh-check result without opening an L2CAP socket. Keeping
+    /// this gate separate gives tests a checker seam with no D-Bus dependency.
+    fn authorize_dial(
+        &mut self,
+        kind: DialKind,
+        generation: u64,
+        fresh: Result<bool, String>,
+    ) -> bool {
+        match fresh {
+            Ok(true) if self.opening_alive(generation) => true,
+            Ok(true) => {
+                warn!("link changed while verifying local Connected; AAP dial cancelled");
+                false
+            }
+            Ok(false) => {
+                warn!(
+                    ?kind,
+                    "fresh BlueZ check says device is not locally connected"
+                );
+                if matches!(kind, DialKind::Automatic) {
+                    self.suppress_automatic("fresh local Connected check failed");
+                }
+                false
+            }
+            Err(e) => {
+                warn!(error = %e, ?kind, "cannot verify local BlueZ link before AAP dial");
+                if matches!(kind, DialKind::Automatic) {
+                    self.suppress_automatic("fresh local Connected check was unavailable");
+                }
+                false
+            }
+        }
+    }
+
+    /// `reconnect` reopens only an already-local ACL. `connect-once` is the
+    /// one explicit exception: it asks BlueZ to connect the pinned paired
+    /// accessory once, then waits for the watcher to authorize AAP normally.
+    fn command_is_current(
+        &self,
+        context: &ConnectionContext,
+        deadline: Instant,
+        reply: &tokio::sync::oneshot::Sender<Response>,
+    ) -> Result<(), &'static str> {
+        if reply.is_closed() {
+            return Err("request client disconnected");
+        }
+        if Instant::now() >= deadline {
+            return Err("request expired before execution");
+        }
+        if self.store.connection_context() != *context {
+            return Err("request context changed before execution");
+        }
+        Ok(())
+    }
+
+    async fn rearm_manual(
+        &mut self,
+        require_pinned: bool,
+        context: &ConnectionContext,
+        deadline: Instant,
+        reply: &tokio::sync::oneshot::Sender<Response>,
+    ) -> Response {
+        if require_pinned && !self.pinned {
+            return Response::error(
+                "connect-once requires aurisd to be started with a pinned device address",
+            );
+        }
+        if require_pinned {
+            let (Some(adapter), Some(device)) = (self.adapter, self.device) else {
+                return Response::error("selected Bluetooth device is not known yet");
+            };
+            let paired = match tokio::time::timeout_at(
+                deadline,
+                bluez::paired_device(adapter, device),
+            )
+            .await
+            {
+                Ok(Ok(paired)) => paired,
+                Ok(Err(e)) => {
+                    return Response::error(format!("could not verify pinned device: {e}"));
+                }
+                Err(_) => return Response::error("timed out verifying pinned device"),
+            };
+            self.drain_link_events();
+            if let Err(reason) = self.command_is_current(context, deadline, reply) {
+                return Response::error(reason);
+            }
+            let Some(paired) = paired else {
+                return Response::error(
+                    "pinned device is unavailable or not paired; BlueZ connect was not attempted",
+                );
+            };
+            // No further device lookup between the authority check and this
+            // one side effect. A request already issued to BlueZ cannot be
+            // recalled by a later timeout; never retry it automatically.
+            return match tokio::time::timeout_at(deadline, paired.connect()).await {
+                Ok(Ok(())) => Response::ok(),
+                Ok(Err(e)) => Response::error(format!("BlueZ connect-once failed: {e}")),
+                Err(_) => Response::error(
+                    "BlueZ connect-once timed out; it may still complete; aurisd will not retry",
+                ),
+            };
+        }
+        match self.fresh_local_connected().await {
+            Ok(true) => {
+                self.drain_link_events();
+                if let Err(reason) = self.command_is_current(context, deadline, reply) {
+                    return Response::error(reason);
+                }
+                self.drop_socket();
+                self.arm_dial(DialKind::Manual, Duration::ZERO);
+                Response::ok()
+            }
+            Ok(false) => Response::error(
+                "device is not connected locally; aurisd will not ask BlueZ to connect it",
+            ),
+            Err(e) => Response::error(e),
+        }
+    }
+
     async fn on_command(&mut self, cmd: Command) {
-        let Command { request, reply } = cmd;
+        if let Err(reason) = self.command_is_current(&cmd.context, cmd.deadline, &cmd.reply) {
+            if !cmd.reply.is_closed() {
+                let _ = cmd.reply.send(Response::error(reason));
+            }
+            return;
+        }
+        let Command {
+            request,
+            reply,
+            context,
+            deadline,
+        } = cmd;
         let response = match request {
             Request::Status => Response::Status(Box::new(self.store.snapshot())),
-            Request::Reconnect => {
-                if self.acl {
-                    self.drop_socket();
-                    self.backoff_idx = 0;
-                    self.recycles = 0;
-                    self.dial_at = Some(Instant::now());
-                    Response::ok()
-                } else {
-                    Response::error("device is not connected: BlueZ reports no classic link")
-                }
-            }
+            // ctl_server takes the connection over before dispatch, so this is
+            // unreachable; answer rather than panic if that ever stops holding.
+            Request::Subscribe => Response::error("subscribe is served by the control server"),
+            Request::Reconnect => self.rearm_manual(false, &context, deadline, &reply).await,
+            Request::ConnectOnce => self.rearm_manual(true, &context, deadline, &reply).await,
             Request::SetNoiseControl { value } => {
                 info!(mode = ?value, "setting noise control");
                 self.send_control(
@@ -406,15 +611,57 @@ impl Supervisor {
                 )
                 .await
             }
+            Request::SetSetting { setting } => {
+                let packet = match codec::encode_set_setting(&setting) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        let _ = reply.send(Response::error(error));
+                        return;
+                    }
+                };
+                info!(key = setting.key(), "sending AirPods setting");
+                self.send_unconfirmed(packet).await
+            }
+            Request::Rename { name } => {
+                let packet = match codec::encode_rename(&name) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        let _ = reply.send(Response::error(error));
+                        return;
+                    }
+                };
+                info!(bytes = name.len(), "sending AirPods rename");
+                self.send_unconfirmed(packet).await
+            }
         };
         let _ = reply.send(response);
+    }
+
+    /// Send a new setting/rename command without changing confirmed state.
+    /// `ok` means only that the datagram was sent; a later accessory echo or
+    /// metadata packet is what updates the snapshot.
+    async fn send_unconfirmed(&mut self, packet: Vec<u8>) -> Response {
+        let Some(sock) = self.sock.clone() else {
+            return Response::error("device is not connected: no AAP link is open");
+        };
+        if let Some(error) = settings_model_error(&self.store.snapshot()) {
+            return Response::error(error);
+        }
+        match send_setting_and_refresh(sock.as_ref(), &packet).await {
+            Ok(()) => Response::ok(),
+            Err(e) => {
+                warn!(error = %e, "failed to send setting packet");
+                self.suppress_automatic("setting send failed");
+                Response::error(format!("failed to send command: {e}"))
+            }
+        }
     }
 
     async fn send_control(&mut self, packet: Vec<u8>, optimistic: Update) -> Response {
         let Some(sock) = self.sock.clone() else {
             return Response::error("device is not connected: no AAP link is open");
         };
-        match send_timed(&sock, &packet).await {
+        match send_timed(sock.as_ref(), &packet).await {
             Ok(()) => {
                 // The accessory echoes the new state on 0x0009, but reflect it
                 // straight away so the widget does not lag behind the click.
@@ -423,14 +670,14 @@ impl Supervisor {
             }
             Err(e) => {
                 warn!(error = %e, "failed to send control packet");
-                self.recycle("control send failed").await;
+                self.suppress_automatic("control send failed");
                 Response::error(format!("failed to send command: {e}"))
             }
         }
     }
 
     fn on_packet(&mut self, bytes: &[u8]) {
-        trace!(rx = %hex(bytes), "AAP recv");
+        trace!(len = bytes.len(), "AAP recv");
         self.last_packet = Some(Instant::now());
         self.idle_probe_at = None;
         match codec::decode(bytes) {
@@ -457,11 +704,28 @@ impl Supervisor {
             Ok(Packet::Control(ControlState::AdaptiveLevel(v))) => {
                 self.store.apply(Update::AdaptiveLevel(v));
             }
-            Ok(Packet::Control(ControlState::Other { id, value })) => {
-                debug!(id, value, "unmodelled control echo");
+            Ok(Packet::Control(ControlState::Setting(setting))) => {
+                debug!(key = setting.key(), "AirPods setting report received");
+                self.store.apply(Update::Setting(setting));
+            }
+            Ok(Packet::Control(ControlState::Other { id, value: _ })) => {
+                // Do not log raw values: settings reports can contain user
+                // preferences. The control payload begins after the six-byte
+                // AAP header, including any unmodelled trailing bytes.
+                debug!(
+                    id,
+                    len = bytes.len().saturating_sub(6),
+                    "unmodelled control echo"
+                );
             }
             Ok(Packet::Metadata(md)) => {
-                info!(?md, "device metadata");
+                info!(
+                    name = md.name.is_some(),
+                    model = md.model.is_some(),
+                    serial = md.serial.is_some(),
+                    firmware = md.firmware.is_some(),
+                    "device metadata"
+                );
                 self.store.apply(Update::Metadata(md));
             }
             Ok(Packet::ConversationalAwarenessLevel(level)) => {
@@ -505,14 +769,14 @@ impl Supervisor {
                         let sock = self.sock.clone();
                         if let Some(s) = sock {
                             if let Err(e) =
-                                send_timed(&s, &codec::encode_request_notifications()).await
+                                send_timed(s.as_ref(), &codec::encode_request_notifications()).await
                             {
                                 warn!(error = %e, "resend failed");
-                                self.recycle("resend failed").await;
+                                self.suppress_automatic("notification resend failed");
                             }
                         }
                     } else {
-                        self.recycle("no battery packet after re-requests").await;
+                        self.suppress_automatic("battery watchdog unanswered");
                     }
                     return;
                 }
@@ -524,50 +788,81 @@ impl Supervisor {
                 let Some(s) = self.sock.clone() else { return };
                 debug!("no AAP traffic for 300 s; probing with request-notifications");
                 self.idle_probe_at = Some(now);
-                if let Err(e) = send_timed(&s, &codec::encode_request_notifications()).await {
+                if let Err(e) = send_timed(s.as_ref(), &codec::encode_request_notifications()).await
+                {
                     warn!(error = %e, "idle probe send failed");
-                    self.recycle_idle("idle probe send failed").await;
+                    self.suppress_automatic("idle probe send failed");
                 }
             }
             IdleAction::Recycle => {
-                self.recycle_idle("idle probe went unanswered for 15 s")
-                    .await;
+                self.suppress_automatic("idle probe went unanswered for 15 s");
             }
         }
     }
 
     async fn dial(&mut self) {
-        // Verify before clearing `dial_at`: without both addresses there is
-        // nothing to dial, and dropping the deadline here would strand the
-        // machine with acl=true and no socket and no retry armed.
+        // Events always win over a deadline. In particular, do not turn a
+        // queued `Connected=false` into a kernel L2CAP connect attempt.
+        self.drain_link_events();
+        if !self.acl {
+            return;
+        }
+        let Some(kind) = self.dial_kind.take() else {
+            return;
+        };
+        let generation = self.link_generation;
         let (Some(adapter), Some(device)) = (self.adapter, self.device) else {
-            debug!("dial deadline reached with no adapter/device address yet");
-            self.schedule_backoff();
+            self.suppress_automatic("dial reached without a selected Bluetooth identity");
             return;
         };
         self.dial_at = None;
 
-        debug!(%device, psm = self.cfg.psm, raw = self.cfg.raw_socket, "dialing AAP");
-        let link = match tokio::time::timeout(
+        // The watcher is advisory; `Connected` is read again immediately
+        // before dialing because L2CAP connect can initiate an ACL in-kernel.
+        if !self.authorize_dial(kind, generation, self.fresh_local_connected().await) {
+            return;
+        }
+
+        debug!(%device, psm = self.cfg.psm, raw = self.cfg.raw_socket, ?kind, "dialing guarded AAP");
+        let connect = tokio::time::timeout(
             CONNECT_TIMEOUT,
             socket::connect(adapter, device, self.cfg.psm, self.cfg.raw_socket),
-        )
-        .await
-        {
-            Ok(Ok(link)) => link,
-            Ok(Err(e)) => {
-                warn!(error = %e, errno = ?e.raw_os_error(), "AAP connect failed");
-                self.schedule_backoff();
-                return;
-            }
-            Err(_) => {
-                warn!("AAP connect timed out");
-                self.schedule_backoff();
-                return;
+        );
+        tokio::pin!(connect);
+        let link = loop {
+            tokio::select! {
+                biased;
+                ev = self.link_rx.recv() => match ev {
+                    Some(ev) => {
+                        self.on_link(ev);
+                        if !self.opening_alive(generation) {
+                            warn!("link changed while AAP connect was in flight; cancelling");
+                            return;
+                        }
+                    }
+                    None => return,
+                },
+                result = &mut connect => match result {
+                    Ok(Ok(link)) => break link,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, errno = ?e.raw_os_error(), "AAP connect failed");
+                        self.suppress_automatic("AAP connect failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("AAP connect timed out");
+                        self.suppress_automatic("AAP connect timed out");
+                        return;
+                    }
+                },
             }
         };
 
         let sock = Arc::new(link);
+        if !self.opening_alive(generation) {
+            warn!("link changed after AAP connect; discarding socket");
+            return;
+        }
         // Cleared before the opening sequence, not after: a battery packet can
         // arrive while we are still waiting on an ack, and that is exactly the
         // evidence the variant fallback needs.
@@ -591,26 +886,31 @@ impl Supervisor {
         // 1. Handshake, then wait for the accessory to answer it. The
         //    accessory ignores everything sent before it has acked, which is
         //    what the old fixed 250 ms spacing was guessing at.
-        if let Err(e) = send_timed(&sock, &codec::encode_handshake()).await {
+        if !self.opening_alive(generation) {
+            return;
+        }
+        if let Err(e) = send_timed(sock.as_ref(), &codec::encode_handshake()).await {
             warn!(error = %e, "handshake send failed");
-            self.schedule_backoff();
+            self.suppress_automatic("handshake send failed");
             return;
         }
         match self
-            .await_ack(&sock, Awaited::Handshake, HANDSHAKE_ACK_WAIT)
+            .await_ack(&*sock, Awaited::Handshake, HANDSHAKE_ACK_WAIT, generation)
             .await
         {
             AckWait::Got => debug!("handshake ack received"),
             AckWait::TimedOut => {
                 warn!(?variant, "no handshake ack");
-                drop(sock);
-                self.recycle("no handshake ack").await;
+                self.suppress_automatic("no handshake ack");
                 return;
             }
             AckWait::Failed(e) => {
                 warn!(error = %e, "handshake ack wait failed");
-                drop(sock);
-                self.schedule_backoff();
+                self.suppress_automatic("handshake ack wait failed");
+                return;
+            }
+            AckWait::Cancelled => {
+                warn!("link changed during handshake; AAP opening cancelled");
                 return;
             }
         }
@@ -628,10 +928,12 @@ impl Supervisor {
             vec![codec::encode_set_features(variant)]
         };
         for (i, packet) in pre.iter().enumerate() {
-            if let Err(e) = send_timed(&sock, packet).await {
+            if !self.opening_alive(generation) {
+                return;
+            }
+            if let Err(e) = send_timed(sock.as_ref(), packet).await {
                 warn!(error = %e, step = i, "AAP opening sequence failed");
-                drop(sock);
-                self.schedule_backoff();
+                self.suppress_automatic("AAP opening sequence send failed");
                 return;
             }
         }
@@ -639,44 +941,43 @@ impl Supervisor {
         // 3. The features ack is advisory: some firmware never sends one, so a
         //    timeout is logged and the sequence continues.
         match self
-            .await_ack(&sock, Awaited::Features, FEATURES_ACK_WAIT)
+            .await_ack(&*sock, Awaited::Features, FEATURES_ACK_WAIT, generation)
             .await
         {
             AckWait::Got => debug!("features ack received"),
             AckWait::TimedOut => info!("no set-features ack; continuing anyway"),
             AckWait::Failed(e) => {
                 warn!(error = %e, "features ack wait failed");
-                drop(sock);
-                self.schedule_backoff();
+                self.suppress_automatic("features ack wait failed");
+                return;
+            }
+            AckWait::Cancelled => {
+                warn!("link changed during feature negotiation; AAP opening cancelled");
                 return;
             }
         }
 
         // 4. On the default order the subscribe comes last.
         if !alt_order {
-            if let Err(e) = send_timed(&sock, &codec::encode_request_notifications()).await {
+            if !self.opening_alive(generation) {
+                return;
+            }
+            if let Err(e) = send_timed(sock.as_ref(), &codec::encode_request_notifications()).await
+            {
                 warn!(error = %e, "request-notifications send failed");
-                drop(sock);
-                self.schedule_backoff();
+                self.suppress_automatic("request-notifications send failed");
                 return;
             }
         }
 
-        // Dialing can take seconds; BlueZ may already have reported
-        // Connected=false. Drain anything queued before claiming the link.
-        while let Ok(ev) = self.link_rx.try_recv() {
-            self.on_link(ev);
-        }
-        if !self.acl {
-            warn!("ACL dropped while dialing; discarding the fresh AAP socket");
-            drop(sock);
+        if !self.opening_alive(generation) {
+            warn!("link changed while opening AAP; discarding fresh socket");
             return;
         }
 
         info!(%device, ?variant, "AAP link up");
         let now = Instant::now();
         self.sock = Some(sock);
-        self.session_start = Some(now);
         // The battery watchdog counts from the last request-notifications,
         // which is the packet that was just sent.
         self.handshake_at = Some(now);
@@ -686,7 +987,13 @@ impl Supervisor {
 
     /// Wait for one opening-sequence acknowledgement, handling every other
     /// frame that arrives meanwhile exactly as the running loop would.
-    async fn await_ack(&mut self, sock: &Arc<Link>, want: Awaited, budget: Duration) -> AckWait {
+    async fn await_ack<S: AapSocket + ?Sized>(
+        &mut self,
+        sock: &S,
+        want: Awaited,
+        budget: Duration,
+        generation: u64,
+    ) -> AckWait {
         let deadline = Instant::now() + budget;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -694,10 +1001,25 @@ impl Supervisor {
                 return AckWait::TimedOut;
             }
             let mut buf = vec![0u8; RECV_BUF];
-            let n = match tokio::time::timeout(left, sock.recv(&mut buf)).await {
-                Err(_) => return AckWait::TimedOut,
-                Ok(Err(e)) => return AckWait::Failed(e),
-                Ok(Ok(n)) => n,
+            let deadline = tokio::time::sleep(left);
+            tokio::pin!(deadline);
+            let n = tokio::select! {
+                biased;
+                ev = self.link_rx.recv() => match ev {
+                    Some(ev) => {
+                        self.on_link(ev);
+                        if !self.opening_alive(generation) {
+                            return AckWait::Cancelled;
+                        }
+                        continue;
+                    }
+                    None => return AckWait::Cancelled,
+                },
+                _ = &mut deadline => return AckWait::TimedOut,
+                result = sock.recv(&mut buf) => match result {
+                    Ok(n) => n,
+                    Err(e) => return AckWait::Failed(e),
+                },
             };
             if n == 0 {
                 return AckWait::Failed(std::io::Error::new(
@@ -718,48 +1040,15 @@ impl Supervisor {
         }
     }
 
-    fn schedule_backoff(&mut self) {
-        let idx = self.backoff_idx.min(BACKOFF_SECS.len() - 1);
-        let delay = jitter(Duration::from_secs(BACKOFF_SECS[idx]));
-        self.backoff_idx += 1;
-        debug!(?delay, "scheduling AAP redial");
-        self.dial_at = Some(Instant::now() + delay);
+    fn drain_link_events(&mut self) {
+        while let Ok(ev) = self.link_rx.try_recv() {
+            self.on_link(ev);
+        }
     }
 
-    async fn recycle(&mut self, reason: &str) {
-        self.recycle_inner(reason, true).await;
-    }
-
-    /// Recycle without crediting the session for having survived.
-    ///
-    /// An idle recycle happens long after `SURVIVED`, so the ordinary path
-    /// would zero `recycles` every time and the budget would never be spent:
-    /// the daemon would flap the link forever instead of falling back to the
-    /// slow poll.
-    async fn recycle_idle(&mut self, reason: &str) {
-        self.recycle_inner(reason, false).await;
-    }
-
-    async fn recycle_inner(&mut self, reason: &str, credit_survival: bool) {
-        let survived = self.session_start.is_some_and(|t| t.elapsed() >= SURVIVED);
-        warn!(reason, survived, "recycling AAP session");
-        self.drop_socket();
-        if !self.acl {
-            return;
-        }
-        if survived {
-            self.backoff_idx = 0;
-            if credit_survival {
-                self.recycles = 0;
-            }
-        }
-        self.recycles += 1;
-        if self.recycles > MAX_RECYCLES {
-            warn!("recycle budget spent; slow polling");
-            self.dial_at = Some(Instant::now() + SLOW_POLL);
-        } else {
-            self.schedule_backoff();
-        }
+    fn opening_alive(&mut self, generation: u64) -> bool {
+        self.drain_link_events();
+        self.acl && self.link_generation == generation
     }
 }
 
@@ -779,14 +1068,81 @@ async fn recv_one(sock: Option<Arc<Link>>) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aap::codec::BatteryEntry;
 
-    #[test]
-    fn jitter_stays_within_twenty_percent() {
-        let base = Duration::from_secs(10);
-        for _ in 0..64 {
-            let j = jitter(base);
-            assert!(j >= Duration::from_secs(8), "{j:?}");
-            assert!(j <= Duration::from_secs(12), "{j:?}");
+    #[tokio::test]
+    async fn setting_refresh_is_one_shot_and_never_replays_a_write() {
+        struct RecordingSocket {
+            sent: std::sync::Mutex<Vec<Vec<u8>>>,
+            fail_at: Option<usize>,
+            short_write: bool,
+        }
+        impl AapSocket for RecordingSocket {
+            async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(packet.to_vec());
+                if self.fail_at == Some(sent.len()) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                Ok(packet.len() - usize::from(self.short_write))
+            }
+            async fn recv(&self, _packet: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!("refresh must not consume reports outside the session reader")
+            }
+        }
+        let packet = codec::encode_set_setting(&crate::settings::SettingCommand::PressSpeed(
+            crate::settings::PressSpeed::Slower,
+        ))
+        .unwrap();
+        for (fail_at, short_write, success, attempts) in [
+            (None, false, true, 2),
+            (Some(1), false, false, 1),
+            (Some(2), false, true, 2),
+            (None, true, false, 1),
+        ] {
+            let socket = RecordingSocket {
+                sent: std::sync::Mutex::new(Vec::new()),
+                fail_at,
+                short_write,
+            };
+            assert_eq!(
+                send_setting_and_refresh(&socket, &packet).await.is_ok(),
+                success
+            );
+            let sent = socket.sent.lock().unwrap();
+            assert_eq!(sent.len(), attempts);
+            assert_eq!(sent[0], packet);
+            if attempts == 2 {
+                assert_eq!(sent[1], codec::encode_request_notifications());
+            }
+        }
+    }
+
+    fn command(
+        store: &Store,
+        request: Request,
+    ) -> (Command, tokio::sync::oneshot::Receiver<Response>) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        (
+            Command {
+                request,
+                reply,
+                context: store.connection_context(),
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
+            rx,
+        )
+    }
+
+    struct PendingSocket;
+
+    impl AapSocket for PendingSocket {
+        async fn send(&self, _buf: &[u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+
+        async fn recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
         }
     }
 
@@ -816,10 +1172,192 @@ mod tests {
     }
 
     #[test]
-    fn idle_threshold_outlives_the_survival_window() {
-        // An idle recycle always lands after SURVIVED, which is exactly why it
-        // must not credit the session and zero the recycle budget.
-        assert!(IDLE_TIMEOUT > SURVIVED);
+    fn local_link_edges_arm_at_most_one_automatic_dial() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor = Supervisor::new(store, SessionConfig::default(), link_rx, cmd_rx);
+
+        supervisor.on_link(LinkEvent::Connected(true));
+        assert_eq!(supervisor.dial_kind, Some(DialKind::Automatic));
+        let first_generation = supervisor.link_generation;
+
+        // Repeated `true` is not a fresh local reconnect and cannot rearm.
+        supervisor.suppress_automatic("test ambiguity");
+        supervisor.on_link(LinkEvent::Connected(true));
+        assert_eq!(supervisor.dial_kind, None);
+        assert_eq!(supervisor.link_generation, first_generation);
+
+        supervisor.on_link(LinkEvent::Connected(false));
+        supervisor.on_link(LinkEvent::Connected(true));
+        assert_eq!(
+            supervisor.dial_kind,
+            Some(DialKind::Automatic),
+            "a new false->true observation starts a new local-link period"
+        );
+    }
+
+    #[test]
+    fn identity_change_cancels_authority_before_a_dial() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor = Supervisor::new(store, SessionConfig::default(), link_rx, cmd_rx);
+        let adapter: Address = "00:11:22:33:44:55".parse().unwrap();
+        let first: Address = "AA:BB:CC:DD:EE:01".parse().unwrap();
+        let second: Address = "AA:BB:CC:DD:EE:02".parse().unwrap();
+
+        supervisor.on_link(LinkEvent::Identity {
+            adapter,
+            address: first,
+            name: None,
+            model_id: None,
+            pinned: false,
+        });
+        supervisor.on_link(LinkEvent::Connected(true));
+        let old_generation = supervisor.link_generation;
+        assert_eq!(supervisor.dial_kind, Some(DialKind::Automatic));
+
+        supervisor.on_link(LinkEvent::Identity {
+            adapter,
+            address: second,
+            name: None,
+            model_id: None,
+            pinned: false,
+        });
+        assert!(!supervisor.acl);
+        assert_eq!(supervisor.dial_kind, None);
+        assert_ne!(supervisor.link_generation, old_generation);
+    }
+
+    #[test]
+    fn fake_checker_and_link_events_cannot_authorize_an_unsafe_dial() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor = Supervisor::new(store, SessionConfig::default(), link_rx, cmd_rx);
+        supervisor.on_link(LinkEvent::Connected(true));
+        let generation = supervisor.link_generation;
+
+        // The checker seam returns false: no dial can start and no retry is
+        // left armed in this local-link period.
+        let fake_disconnected_checker = || Ok::<bool, ()>(false);
+        assert!(!supervisor.authorize_dial(
+            DialKind::Automatic,
+            generation,
+            fake_disconnected_checker().map_err(|_| "fake checker: disconnected".into()),
+        ));
+        assert!(supervisor.auto_suppressed);
+        assert_eq!(supervisor.dial_kind, None);
+
+        // A late disconnect and adapter loss invalidate an in-flight opening
+        // generation even if a checker had returned true earlier.
+        supervisor.on_link(LinkEvent::Connected(false));
+        assert!(!supervisor.opening_alive(generation));
+        supervisor.on_link(LinkEvent::AdapterGone);
+        assert!(!supervisor.opening_alive(generation));
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_a_real_pending_handshake_wait() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor = Supervisor::new(store, SessionConfig::default(), link_rx, cmd_rx);
+        supervisor.on_link(LinkEvent::Connected(true));
+        let generation = supervisor.link_generation;
+        link_tx.send(LinkEvent::Connected(false)).await.unwrap();
+
+        let result = supervisor
+            .await_ack(
+                &PendingSocket,
+                Awaited::Handshake,
+                Duration::from_secs(1),
+                generation,
+            )
+            .await;
+        assert!(matches!(result, AckWait::Cancelled));
+        assert!(!supervisor.acl);
+    }
+
+    #[test]
+    fn tentative_opening_cleanup_invalidates_aap_data_without_a_promoted_socket() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor =
+            Supervisor::new(store.clone(), SessionConfig::default(), link_rx, cmd_rx);
+        store.apply(Update::Battery(vec![BatteryEntry {
+            component: codec::BatteryComponent::Left,
+            level: Some(40),
+            charging: false,
+            present: true,
+        }]));
+        assert!(store.snapshot().battery.left.fresh);
+        supervisor.drop_socket();
+        assert!(!store.snapshot().battery.left.fresh);
+    }
+
+    #[tokio::test]
+    async fn queued_context_change_rejects_a_non_status_command_before_action() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor =
+            Supervisor::new(store.clone(), SessionConfig::default(), link_rx, cmd_rx);
+        let (command, reply) = command(
+            &store,
+            Request::SetNoiseControl {
+                value: crate::state::NoiseControlMode::Anc,
+            },
+        );
+        // This is a real non-status command path, but the queue context was
+        // captured before the local link changed.
+        store.apply(Update::AclConnected(true));
+        supervisor.on_command(command).await;
+        let response = reply.await.unwrap();
+        assert!(matches!(response, Response::Ack { ok: false, .. }));
+        assert_eq!(
+            store.snapshot().noise_control,
+            crate::state::NoiseControl::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_and_closed_queued_commands_are_inert() {
+        use crate::config::PrimaryBud;
+
+        let store = Store::new(Snapshot::initial(""), PrimaryBud::Auto);
+        let (_link_tx, link_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut supervisor =
+            Supervisor::new(store.clone(), SessionConfig::default(), link_rx, cmd_rx);
+
+        let (mut expired, reply) = command(&store, Request::Reconnect);
+        expired.deadline = Instant::now() - Duration::from_millis(1);
+        supervisor.on_command(expired).await;
+        assert!(matches!(
+            reply.await.unwrap(),
+            Response::Ack { ok: false, .. }
+        ));
+
+        let (closed, reply) = command(&store, Request::ConnectOnce);
+        drop(reply);
+        let before = store.snapshot();
+        supervisor.on_command(closed).await;
+        assert_eq!(store.snapshot(), before);
     }
 
     #[test]
@@ -883,5 +1421,21 @@ mod tests {
         // must still be the longer window once the link is claimed.
         assert!(HANDSHAKE_ACK_WAIT + FEATURES_ACK_WAIT < BATTERY_WATCHDOG);
         assert!(HANDSHAKE_ACK_WAIT + FEATURES_ACK_WAIT < CONNECT_TIMEOUT + BATTERY_WATCHDOG);
+    }
+
+    #[test]
+    fn settings_model_gate_uses_the_current_did() {
+        let mut snapshot = Snapshot::initial("");
+        assert!(settings_model_error(&snapshot)
+            .unwrap()
+            .contains("model is unknown"));
+
+        snapshot.device.model_id = "200E".into();
+        assert!(settings_model_error(&snapshot)
+            .unwrap()
+            .contains("unsupported device model 200E"));
+
+        snapshot.device.model_id = "201B".into();
+        assert_eq!(settings_model_error(&snapshot), None);
     }
 }
