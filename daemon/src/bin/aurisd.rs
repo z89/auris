@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use aurisd::{
-    aap::session::{SessionConfig, Supervisor},
+    aap::session::{AutoConnectOptions, HandoffOptions, SessionConfig, Supervisor},
     bluez,
     config::{self, Config},
     ctl_server,
@@ -13,7 +13,7 @@ use aurisd::{
     writer,
 };
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +38,11 @@ struct Args {
 const CMD_QUEUE: usize = 16;
 /// Link-event queue depth.
 const LINK_QUEUE: usize = 16;
+/// Playback-reading and pause-request queue depth.
+const PLAYBACK_QUEUE: usize = 8;
+/// Proximity-sighting queue depth. Adverts repeat, so dropping one when the
+/// supervisor is busy costs nothing.
+const SIGHTING_QUEUE: usize = 8;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -104,6 +109,26 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(ctl_server::serve(listener, Arc::clone(&store), cmd_tx));
     tokio::spawn(bluez::run(link_tx, pinned));
     tokio::spawn(aurisd::ble::run(Arc::clone(&store), cfg.ble, pinned));
+    // Read once; shared read-only by the rejoin decision.
+    let apple_ouis = Arc::new(aurisd::rejoin::AppleOuis::load());
+    info!(
+        count = apple_ouis.len(),
+        source = apple_ouis.source().as_str(),
+        "Apple OUIs loaded"
+    );
+    let (playback_tx, playback_rx) = mpsc::channel(PLAYBACK_QUEUE);
+    let (mpris_tx, mpris_rx) = mpsc::channel(PLAYBACK_QUEUE);
+    tokio::spawn(aurisd::mpris::run(playback_tx, mpris_rx));
+    // Proximity auto-connect: the scanner only reports adverts, and the
+    // supervisor decides, so BlueZ never sees two sources of Device1.Connect.
+    let (seen_tx, seen_rx) = mpsc::channel(SIGHTING_QUEUE);
+    let (scan_tx, scan_rx) = watch::channel(false);
+    tokio::spawn(aurisd::autoconnect::run(
+        Arc::clone(&store),
+        cfg.autoconnect.clone(),
+        seen_tx,
+        scan_rx,
+    ));
     tokio::spawn(
         Supervisor::new(
             Arc::clone(&store),
@@ -111,11 +136,33 @@ async fn main() -> anyhow::Result<()> {
             link_rx,
             cmd_rx,
         )
+        .with_handoff(HandoffOptions {
+            config: cfg.handoff,
+            config_path: config::config_path(),
+            playback_rx: Some(playback_rx),
+            mpris_tx: Some(mpris_tx),
+            control_audio_profiles: true,
+            known_hosts_path: aurisd::rejoin::known_hosts_path(),
+            apple_ouis: Some(apple_ouis),
+            control_link: true,
+        })
+        .with_autoconnect(AutoConnectOptions {
+            config: cfg.autoconnect,
+            seen_rx,
+            scan_tx,
+            control_link: true,
+        })
+        .with_ear_media(cfg.ear)
         .run(),
     );
 
     wait_for_shutdown().await;
     info!("shutting down");
+
+    // A yield sets the AirPods' PipeWire card to `off`. Nothing else would
+    // put it back once this process is gone, and the user would find a silent
+    // pair of AirPods.
+    aurisd::audio_route::restore_on_exit().await;
 
     // The debounced writer may never get another turn, so publish the closing
     // state synchronously: the link is gone and the batteries are stale.

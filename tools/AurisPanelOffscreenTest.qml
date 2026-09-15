@@ -119,7 +119,10 @@ Window {
             "adaptive_level": 45
         };
         if (settingsApi) {
-            snapshot.settings_api = 1;
+            // settings_api 3 verifies its own writes, a rename among them:
+            // every snapshot carries the requested values and what
+            // verification made of them.
+            snapshot.settings_api = 3;
             snapshot.settings = {
                 "microphone": "auto",
                 "press_speed": "default",
@@ -128,6 +131,10 @@ Window {
                 "call_controls": "mute_once_hangup_twice",
                 "personalized_volume": true
             };
+            snapshot.settings_requested = {};
+            snapshot.settings_status = {};
+            snapshot.settings_verify = "idle";
+            snapshot.verify_reopen = false;
         }
         return JSON.stringify(snapshot);
     }
@@ -224,31 +231,97 @@ Window {
                 testWindow.check(batteryCase !== null && batteryCase.level === 62 && batteryCase.charging && batteryCase.caption === "charging" && !batteryCase.dim, "case battery row lost charging/lid state");
                 testWindow.check(adaptiveSlider !== null && adaptiveSlider.enabled && adaptiveSlider.value === 45, "Adaptive slider did not expose the connected Adaptive state");
 
-                // A repeated snapshot is not an echo of a write. New daemons
-                // provide a per-key sequence so an old Auto report cannot
-                // confirm a later request until its counter advances.
-                const sequenced = JSON.parse(testWindow.connectedSnapshot(true));
-                sequenced.settings_report_seq = {
-                    "microphone": 7
+                // The daemon reports one status per key. The widget shows the
+                // requested value while that is what the daemon is carrying, and
+                // repeats the daemon's verdict rather than inventing one.
+                const verified = JSON.parse(testWindow.connectedSnapshot(true));
+                verified.settings.press_speed = "slower";
+                verified.settings_requested = {
+                    "microphone": "right",
+                    "press_speed": "slower",
+                    "hold_duration": "shorter",
+                    "listening_mode_cycle": ["off", "anc"],
+                    "call_controls": "hangup_once_mute_twice",
+                    "personalized_volume": false
                 };
-                testWindow.check(testWindow.widget.settingsReportSequenceFor(sequenced, "press_speed") === 0, "missing per-key report counter did not use baseline zero");
-                testWindow.widget.parseState(JSON.stringify(sequenced));
-                testWindow.widget.pendingAdvanced = {
-                    "microphone": {
-                        "target": "right",
-                        "address": sequenced.device.address,
-                        "state": "awaiting",
-                        "queued": null,
-                        "reportSequence": 7
-                    }
+                verified.settings_requested["name"] = "Auris Pods";
+                verified.settings_status = {
+                    "microphone": "verifying",
+                    "press_speed": "confirmed",
+                    "hold_duration": "mismatch",
+                    "listening_mode_cycle": "unreported",
+                    "call_controls": "unverified",
+                    "name": "mismatch"
                 };
-                const staleMatchingCounter = JSON.parse(JSON.stringify(sequenced));
-                staleMatchingCounter.settings.microphone = "right";
-                testWindow.widget.parseState(JSON.stringify(staleMatchingCounter));
-                testWindow.check(testWindow.widget.pendingAdvanced.microphone !== undefined, "unchanged setting report counter falsely confirmed a write");
-                staleMatchingCounter.settings_report_seq.microphone = 8;
-                testWindow.widget.parseState(JSON.stringify(staleMatchingCounter));
-                testWindow.check(testWindow.widget.pendingAdvanced.microphone === undefined, "new matching setting report did not confirm the write");
+                verified.settings_verify = "reopening";
+                testWindow.widget.parseState(JSON.stringify(verified));
+                testWindow.check(testWindow.widget.effectiveSetting("microphone") === "right", "a write being verified snapped back to the old device value");
+                testWindow.check(testWindow.widget.effectiveSetting("press_speed") === "slower", "a confirmed write did not stay on screen");
+                testWindow.check(testWindow.widget.effectiveSetting("hold_duration") === "default", "a mismatch did not fall back to the value the AirPods kept");
+                testWindow.check(testWindow.widget.effectiveSetting("call_controls") === "hangup_once_mute_twice", "an unverified write was withdrawn from the control");
+                testWindow.check(testWindow.widget.effectiveSetting("personalized_volume") === true, "a key with no status stopped showing the device value");
+                const captions = testWindow.widget.advancedCaptions;
+                testWindow.check(captions.microphone.text === "Verifying with AirPods\u2026", "verifying caption is wrong: " + captions.microphone.text);
+                testWindow.check(captions.press_speed.text === "Confirmed", "confirmed caption is wrong: " + captions.press_speed.text);
+                testWindow.check(captions.hold_duration.text === "AirPods kept Default", "mismatch caption does not name the value the AirPods kept: " + captions.hold_duration.text);
+                testWindow.check(captions.listening_mode_cycle.text === "Applied. AirPods 4 doesn't report this setting back.", "unreported caption is wrong: " + captions.listening_mode_cycle.text);
+                testWindow.check(captions.call_controls.text === "Sent, not verified", "unverified caption is wrong: " + captions.call_controls.text);
+                testWindow.check(captions.personalized_volume === undefined, "a key with no status was given a caption");
+                testWindow.check(String(captions.hold_duration.color) === String(Theme.error), "a mismatch is not in the error colour");
+                testWindow.check(String(captions.call_controls.color) === String(Theme.warning), "an unverified write is not in the warning colour");
+                testWindow.check(String(captions.microphone.color) === String(Theme.surfaceVariantText), "an ordinary caption borrowed a semantic colour");
+                // A rename is verified like any other setting, under the
+                // daemon's "name" key, and names what the AirPods kept.
+                testWindow.check(captions.rename !== undefined && captions.rename.text === "AirPods kept " + testWindow.widget.confirmedDeviceName, "a rename mismatch did not name the device's own name: " + JSON.stringify(captions.rename));
+                testWindow.check(captions.name === undefined, "the daemon's name key leaked into the panel's caption map");
+                const renamed = JSON.parse(JSON.stringify(verified));
+                renamed.settings_status.name = "confirmed";
+                renamed.device.name = "Auris Pods";
+                testWindow.widget.parseState(JSON.stringify(renamed));
+                testWindow.check(testWindow.widget.advancedCaptions.rename.text === "Confirmed", "a confirmed rename was not reported by the daemon's status");
+                testWindow.check(testWindow.widget.settingStatusOf("rename") === "confirmed", "the rename status did not reach the widget");
+                const legacyRename = JSON.parse(JSON.stringify(renamed));
+                legacyRename.settings_api = 2;
+                testWindow.widget.parseState(JSON.stringify(legacyRename));
+                testWindow.check(testWindow.widget.advancedCaptions.rename === undefined, "a daemon that cannot verify a rename still captioned one");
+                testWindow.widget.parseState(JSON.stringify(verified));
+
+                const settingsItem = settingsLoader.item;
+                testWindow.check(testWindow.findNamed(settingsItem, "settingCaption_hold_duration") !== null, "the settings component has no caption lane");
+                testWindow.check(testWindow.findNamed(settingsItem, "settingCaption_rename") !== null, "the rename control has no caption lane");
+
+                // The daemon drops the link for about a second to read a write
+                // back. Nothing on screen may call that a disconnect.
+                const beforeReopen = {
+                    "pill": testWindow.widget.pillLevel,
+                    "height": testWindow.panel.implicitHeight,
+                    "quickY": quickControls ? quickControls.y : -1
+                };
+                const reopen = JSON.parse(JSON.stringify(verified));
+                reopen.verify_reopen = true;
+                reopen.device.connected = false;
+                reopen.device.aap_link = false;
+                reopen.battery.stale = true;
+                testWindow.widget.parseState(JSON.stringify(reopen));
+                testWindow.check(testWindow.widget.connected, "a verification reopen was rendered as a disconnect");
+                testWindow.check(!testWindow.widget.deviceConnected, "the raw device connection state was lost");
+                testWindow.check(testWindow.widget.verifyReopen, "verify_reopen did not reach the widget");
+                testWindow.check(testWindow.widget.wantVisible, "the bar pill dropped out for a verification reopen");
+                testWindow.check(testWindow.widget.advancedAvailable, "the settings controls were disabled by a verification reopen");
+                testWindow.check(!testWindow.widget.stale, "a verification reopen dimmed the bar pill");
+                testWindow.check(testWindow.widget.pillLevel === beforeReopen.pill, "the bar pill lost its level during a verification reopen");
+                testWindow.check(testWindow.widget.effectiveSetting("microphone") === "right", "a verification reopen discarded the value being verified");
+                testWindow.check(testWindow.panel.implicitHeight === beforeReopen.height, "a verification reopen changed the panel height");
+                testWindow.check(!quickControls || quickControls.y === beforeReopen.quickY, "a verification reopen moved the everyday controls");
+
+                // An older daemon cannot verify anything, so the widget reports
+                // device values and says nothing at all about the write.
+                const legacy = JSON.parse(JSON.stringify(verified));
+                legacy.settings_api = 1;
+                testWindow.widget.parseState(JSON.stringify(legacy));
+                testWindow.check(Object.keys(testWindow.widget.advancedCaptions).length === 0, "a daemon that cannot verify still produced captions");
+                testWindow.check(testWindow.widget.effectiveSetting("microphone") === "auto", "a daemon that cannot verify did not fall back to device values");
+                testWindow.check(testWindow.widget.effectiveSetting("hold_duration") === "default", "a daemon that cannot verify showed a requested value");
                 testWindow.widget.parseState(testWindow.connectedSnapshot(true));
 
                 // Drive the actual Proc callbacks: a rapid revert is queued
@@ -275,6 +348,28 @@ Window {
                 const beforeRejected = Proc.calls.length;
                 Proc.complete(beforeRejected - 1, "request context changed", 1);
                 testWindow.check(Proc.calls.length === beforeRejected && testWindow.widget.pendingAdvanced.microphone === undefined, "failed command automatically replayed a queued target");
+
+                // A rename is a daemon-verified write like any other: the local
+                // entry is retired by the status, not by the reported name
+                // turning up whenever BlueZ next reads one.
+                Proc.reset();
+                testWindow.widget.requestAdvancedRename("Airpods55655567");
+                testWindow.check(Proc.calls.length === 1, "a rename did not start a command");
+                Proc.complete(0, "", 0);
+                testWindow.check(testWindow.widget.pendingAdvanced.rename !== undefined, "a rename stopped waiting for the daemon's verdict");
+                const renameVerdict = JSON.parse(testWindow.connectedSnapshot(true));
+                renameVerdict.settings_requested = {
+                    "name": "Airpods55655567"
+                };
+                renameVerdict.settings_status = {
+                    "name": "confirmed"
+                };
+                renameVerdict.device.name = "Airpods55655567";
+                testWindow.widget.parseState(JSON.stringify(renameVerdict));
+                testWindow.check(testWindow.widget.pendingAdvanced.rename === undefined, "a confirmed rename was not retired by the daemon's status");
+                testWindow.check(testWindow.widget.advancedCaptions.rename.text === "Confirmed", "a confirmed rename produced no caption");
+                testWindow.widget.parseState(testWindow.connectedSnapshot(true));
+
                 Proc.controlled = false;
                 if (batteryRight) {
                     const rightTrack = testWindow.findNamed(batteryRight, "batteryTrack");
@@ -367,6 +462,67 @@ Window {
                 unlinked.device.aap_link = false;
                 testWindow.widget.parseState(JSON.stringify(unlinked));
                 testWindow.check(adaptiveSlider !== null && !adaptiveSlider.enabled, "unlinked Adaptive adjustment is still enabled");
+                // A daemon healing the link keeps the module on screen with
+                // its last readings dimmed and one neutral line. The reason
+                // the daemon inferred is never shown.
+                const linkRow = testWindow.findNamed(testWindow.panel, "aurisLinkText");
+                const linkSlot = testWindow.findNamed(testWindow.panel, "aurisLinkSlot");
+                testWindow.check(linkRow !== null && linkSlot !== null, "the link status row is missing from the panel");
+                testWindow.check(linkSlot === null || linkSlot.height === 0, "an older daemon without a link object opened the status row");
+                testWindow.check(!testWindow.widget.linkReconnecting && testWindow.widget.linkStatusText === "", "a missing link object was read as reconnecting");
+                const reconnectCaption = "Attempting to reconnect";
+                for (const reason of ["bud_switch", "taken_over", "link_lost", "auto_connect"]) {
+                    const healing = JSON.parse(testWindow.connectedSnapshot(true));
+                    healing.device.connected = false;
+                    healing.device.aap_link = false;
+                    healing.link = {
+                        "status": "reconnecting",
+                        "reason": reason,
+                        "attempt": 1,
+                        "since": new Date().toISOString()
+                    };
+                    testWindow.widget.parseState(JSON.stringify(healing));
+                    testWindow.check(testWindow.widget.connected && testWindow.widget.moduleShouldShow, reason + ": a reconnect was rendered as a disconnect");
+                    testWindow.check(!testWindow.widget.disconnectGrace, reason + ": an announced reconnect fell back to the grace");
+                    testWindow.check(testWindow.widget.linkReason === reason, reason + ": the daemon's reason was lost");
+                    testWindow.check(testWindow.widget.linkStatusText === reconnectCaption, reason + ": wrong status line: " + testWindow.widget.linkStatusText);
+                    testWindow.check(linkRow.text === reconnectCaption, reason + ": the status row did not show the line");
+                    testWindow.check(testWindow.widget.barContentOpacity < 1, reason + ": the bar icon was left untouched");
+                    testWindow.check(batteryLeft.level === 87 && batteryLeft.dim && batteryRight.dim && batteryCase.dim, reason + ": held readings were dropped or rendered as live");
+                }
+                const attempts = JSON.parse(testWindow.connectedSnapshot(true));
+                attempts.device.connected = false;
+                attempts.link = {
+                    "status": "reconnecting",
+                    "reason": null,
+                    "attempt": 2,
+                    "since": new Date().toISOString()
+                };
+                testWindow.widget.parseState(JSON.stringify(attempts));
+                testWindow.check(testWindow.widget.linkStatusText === reconnectCaption + " \u00b7 attempt 2", "a retry lost its attempt count: " + testWindow.widget.linkStatusText);
+                attempts.link.attempt = 1;
+                testWindow.widget.parseState(JSON.stringify(attempts));
+                testWindow.check(testWindow.widget.linkStatusText === reconnectCaption, "a first attempt was numbered: " + testWindow.widget.linkStatusText);
+                const droppedLink = JSON.parse(testWindow.connectedSnapshot(true));
+                droppedLink.device.connected = false;
+                droppedLink.device.aap_link = false;
+                droppedLink.link = {
+                    "status": "disconnected",
+                    "reason": "link_lost",
+                    "attempt": 3,
+                    "since": new Date().toISOString()
+                };
+                testWindow.widget.parseState(JSON.stringify(droppedLink));
+                testWindow.check(!testWindow.widget.connected && testWindow.widget.disconnectGrace && testWindow.widget.moduleShouldShow, "a dropped link hid the module with no grace at all");
+                testWindow.check(testWindow.widget.linkStatusText === "", "a finished disconnect kept a reconnecting line on screen");
+                // The panel goes with the module, but not before the grace is
+                // out and never while the link is being healed. The timed half
+                // of this lives in the qmltestrunner regression.
+                testWindow.check(testWindow.widget.panelOpen, "the open test panel was not read as open");
+                testWindow.check(!testWindow.widget.panelShouldClose && testWindow.widget.closePopoutCount === 0, "the panel was closed inside the disconnect grace");
+                testWindow.widget.parseState(testWindow.connectedSnapshot(true));
+                testWindow.check(testWindow.widget.connected && !testWindow.widget.disconnectGrace && testWindow.widget.barContentOpacity === 1 && !batteryLeft.dim, "a healed link left the module in its reconnecting treatment");
+
                 testWindow.widget.parseState(testWindow.connectedSnapshot(true));
                 for (const label of ["Device name", "Microphone", "Press speed", "Hold duration", "Listening-mode cycle", "Call controls", "Personalized Volume"])
                     testWindow.check(testWindow.containsText(settingsLoader.item, label), "missing full-panel control: " + label);

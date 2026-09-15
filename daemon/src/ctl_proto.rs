@@ -44,6 +44,19 @@ pub enum Request {
     /// `{"cmd":"connect_once"}` — ask BlueZ once to connect the configured
     /// pinned, paired device. This can transfer audio and never retries.
     ConnectOnce,
+    /// `{"cmd":"take_over"}` — claim the AirPods from another Apple host now:
+    /// ownership 01, media info and Hijackv2 to the other hosts, then connect
+    /// A2DP. Needs an open AAP link; works even when handoff is disabled.
+    TakeOver,
+    /// `{"cmd":"yield"}` — give the AirPods up now: ownership 00, pause local
+    /// players, disconnect A2DP/HFP and keep the AAP link.
+    Yield,
+    /// `{"cmd":"set_handoff","enabled":true}` — switch automatic handoff and
+    /// persist `[handoff] enabled` to config.toml.
+    SetHandoff {
+        /// On or off.
+        enabled: bool,
+    },
     /// `{"cmd":"status"}` — the reply is the state.json object itself.
     Status,
     /// `{"cmd":"subscribe"}` — the current snapshot, then one more every time
@@ -58,7 +71,9 @@ pub enum Request {
 
 /// A reply from the daemon. `status` answers with the snapshot; everything
 /// else answers `{"ok":true}` or `{"ok":false,"error":"..."}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// No `Eq`: the snapshot carries arbitrary JSON in `settings_requested`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Response {
     /// The state.json document, verbatim.
@@ -127,6 +142,12 @@ mod tests {
             ),
             (Request::Reconnect, r#"{"cmd":"reconnect"}"#),
             (Request::ConnectOnce, r#"{"cmd":"connect_once"}"#),
+            (Request::TakeOver, r#"{"cmd":"take_over"}"#),
+            (Request::Yield, r#"{"cmd":"yield"}"#),
+            (
+                Request::SetHandoff { enabled: true },
+                r#"{"cmd":"set_handoff","enabled":true}"#,
+            ),
             (Request::Status, r#"{"cmd":"status"}"#),
             (Request::Subscribe, r#"{"cmd":"subscribe"}"#),
         ];
@@ -154,7 +175,7 @@ mod tests {
         let wire = serde_json::to_string(&Response::Status(Box::new(snap.clone()))).unwrap();
         let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
         assert_eq!(
-            value["schema"], 1,
+            value["schema"], 2,
             "status must be the bare state.json object"
         );
         match serde_json::from_str::<Response>(&wire).unwrap() {

@@ -82,6 +82,16 @@ impl SettingCommand {
         }
     }
 
+    /// The written value as JSON, in exactly the shape [`DeviceSettings`]
+    /// publishes for the same key, so a requested and a reported value can be
+    /// compared without a per-key match.
+    pub fn value_json(&self) -> serde_json::Value {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.get("value").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
     /// Validate invariants not expressible through serde enum decoding.
     pub fn validate(&self) -> Result<(), String> {
         if let Self::ListeningModeCycle(modes) = self {
@@ -153,6 +163,35 @@ mod tests {
         ])
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn requested_value_json_matches_the_published_settings_shape() {
+        let mut settings = DeviceSettings::default();
+        for command in [
+            SettingCommand::Microphone(MicrophoneMode::Left),
+            SettingCommand::PressSpeed(PressSpeed::Slowest),
+            SettingCommand::HoldDuration(HoldDuration::Shorter),
+            SettingCommand::CallControls(CallControls::HangupOnceMuteTwice),
+            SettingCommand::PersonalizedVolume(true),
+            SettingCommand::ListeningModeCycle(vec![
+                NoiseControlMode::Anc,
+                NoiseControlMode::Transparency,
+            ]),
+        ] {
+            let key = command.key();
+            let requested = command.value_json();
+            match command {
+                SettingCommand::Microphone(v) => settings.microphone = Some(v),
+                SettingCommand::PressSpeed(v) => settings.press_speed = Some(v),
+                SettingCommand::HoldDuration(v) => settings.hold_duration = Some(v),
+                SettingCommand::ListeningModeCycle(v) => settings.listening_mode_cycle = Some(v),
+                SettingCommand::CallControls(v) => settings.call_controls = Some(v),
+                SettingCommand::PersonalizedVolume(v) => settings.personalized_volume = Some(v),
+            }
+            let published = serde_json::to_value(&settings).unwrap();
+            assert_eq!(published[key], requested, "shape mismatch for {key}");
+        }
     }
 
     #[test]

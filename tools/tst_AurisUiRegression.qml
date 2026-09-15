@@ -62,7 +62,7 @@ Rectangle {
                     version: "test",
                     source: "aap"
                 },
-                settings_api: 1,
+                settings_api: 2,
                 device: {
                     address: "test",
                     name: "AirPods",
@@ -100,7 +100,11 @@ Rectangle {
                     listening_mode_cycle: ["anc", "transparency"],
                     call_controls: "mute_once_hangup_twice",
                     personalized_volume: true
-                }
+                },
+                settings_requested: {},
+                settings_status: {},
+                settings_verify: "idle",
+                verify_reopen: false
             }));
             panel.sourceComponent = item.popoutContent;
         }
@@ -356,9 +360,8 @@ Rectangle {
         function test_03b_real_setting_click_reaches_command_and_report() {
             const original = JSON.stringify(widget.item.st);
             const snapshot = JSON.parse(original);
-            snapshot.settings_report_seq = {
-                "press_speed": 1
-            };
+            snapshot.settings_requested = {};
+            snapshot.settings_status = {};
             Proc.controlled = true;
             Proc.reset();
             try {
@@ -382,11 +385,20 @@ Rectangle {
                     Proc.complete(previousCalls, '{"ok":true}', 0);
                     compare(widget.item.pendingAdvancedFor("press_speed").state, "awaiting");
                     compare(widget.item.pendingAdvancedFor("press_speed").inFlightSerial, 0, "Completed command would block another click");
-                    snapshot.settings.press_speed = choice[1];
-                    snapshot.settings_report_seq.press_speed++;
+                    // The daemon takes the request over: it appears in
+                    // settings_requested under a status of its own, and the
+                    // local entry retires. No timer decides anything.
+                    snapshot.settings_requested.press_speed = choice[1];
+                    snapshot.settings_status.press_speed = "verifying";
                     widget.item.parseState(JSON.stringify(snapshot));
                     compare(widget.item.pendingAdvancedFor("press_speed"), null);
+                    compare(widget.item.effectiveSetting("press_speed"), choice[1], "the control snapped back while the daemon was verifying");
+                    compare(widget.item.advancedCaptions.press_speed.text, "Verifying with AirPods\u2026");
+                    snapshot.settings.press_speed = choice[1];
+                    snapshot.settings_status.press_speed = "confirmed";
+                    widget.item.parseState(JSON.stringify(snapshot));
                     compare(widget.item.confirmedSetting("press_speed"), choice[1]);
+                    compare(widget.item.advancedCaptions.press_speed.text, "Confirmed");
                     compare(node("aurisQuickControls").y, fixedY);
                 }
             } finally {
@@ -408,13 +420,10 @@ Rectangle {
             grabImage(panel.item).save("/tmp/auris-real-widgets-bottom.png");
         }
 
-        function test_03c_missing_echo_reopens_only_control_link_once() {
+        function test_03c_verification_reopen_is_not_a_disconnect() {
             const original = JSON.stringify(widget.item.st);
             const snapshot = JSON.parse(original);
             snapshot.settings.press_speed = "default";
-            snapshot.settings_report_seq = {
-                "press_speed": 1
-            };
             Proc.controlled = true;
             Proc.reset();
             try {
@@ -427,58 +436,94 @@ Rectangle {
                     "batteryLeftHeight": node("batteryLeft").height,
                     "batteryRightHeight": node("batteryRight").height,
                     "batteryCaseHeight": node("batteryCase").height,
-                    "setupY": node("aurisTechnicalDisclosure").mapToItem(scene, 0, 0).y
+                    "setupY": node("aurisTechnicalDisclosure").mapToItem(scene, 0, 0).y,
+                    "settingsHeight": settings().implicitHeight
                 };
-                function verifyBatteryGeometry(label) {
+                function verifyStableGeometry(label) {
                     compare(panel.item.implicitHeight, stableGeometry.panelHeight, label + ": panel height changed");
                     compare(node("aurisMainScroll").contentHeight, stableGeometry.batteryContentHeight, label + ": battery content height changed");
                     compare(node("batteryLeft").height, stableGeometry.batteryLeftHeight, label + ": left battery row changed");
                     compare(node("batteryRight").height, stableGeometry.batteryRightHeight, label + ": right battery row changed");
                     compare(node("batteryCase").height, stableGeometry.batteryCaseHeight, label + ": case battery row changed");
                     compare(node("aurisTechnicalDisclosure").mapToItem(scene, 0, 0).y, stableGeometry.setupY, label + ": setup moved");
+                    compare(settings().implicitHeight, stableGeometry.settingsHeight, label + ": a caption moved the settings rows");
                 }
                 mouseClick(node("settingChoice_press_speed_1"));
                 tryVerify(() => Proc.calls.length === 1);
                 Proc.complete(0, '{"ok":true}', 0);
-                const pending = widget.item.pendingAdvancedFor("press_speed");
-                pending.sentAt = Date.now() - 1500;
-                widget.item.setAdvancedPending("press_speed", pending);
-                verify(widget.item.maybeStartAdvancedReadback(Date.now()));
-                compare(Proc.calls.length, 2);
-                compare(Proc.calls[1].argv.slice(-1)[0], "reconnect");
-                compare(widget.item.pendingAdvancedFor("press_speed").state, "verifying");
-                verify(!widget.item.maybeStartAdvancedReadback(Date.now()), "readback reopened twice");
+                compare(Proc.calls.length, 1, "the widget reopened the link itself instead of leaving readback to the daemon");
+                compare(widget.item.pendingAdvancedFor("press_speed").state, "awaiting");
 
-                const down = JSON.parse(JSON.stringify(snapshot));
-                down.device.aap_link = false;
-                down.settings = {};
-                down.battery.stale = true;
-                for (const side of ["left", "right", "case"]) {
-                    down.battery[side].source = "aap";
-                    down.battery[side].fresh = false;
-                    down.battery[side].present = false;
-                    down.battery[side].charging = false;
-                    down.battery[side].last_known_charging = false;
-                    down.battery[side].last_seen = new Date().toISOString();
-                }
-                widget.item.parseState(JSON.stringify(down));
+                // The daemon drops and reopens the AAP link purely to read the
+                // write back, reporting connected and aap_link false while it
+                // does. Nothing on screen may call that a disconnect.
+                const reopening = JSON.parse(JSON.stringify(snapshot));
+                reopening.settings_requested = {
+                    "press_speed": "slower"
+                };
+                reopening.settings_status = {
+                    "press_speed": "verifying"
+                };
+                reopening.settings_verify = "reopening";
+                reopening.verify_reopen = true;
+                reopening.device.connected = false;
+                reopening.device.aap_link = false;
+                reopening.battery.stale = true;
+                for (const side of ["left", "right", "case"])
+                    reopening.battery[side].fresh = false;
+                widget.item.parseState(JSON.stringify(reopening));
                 wait(20);
-                verify(widget.item.advancedReadbackSawDown);
-                verify(widget.item.pendingAdvancedFor("press_speed") !== null, "expected readback link close cancelled the request");
-                compare(node("batteryLeft").caption.indexOf("last seen"), 0);
-                verifyBatteryGeometry("AAP readback link down");
-                Proc.complete(1, '{"ok":true}', 0);
+                verify(widget.item.connected, "a verification reopen was rendered as a disconnect");
+                verify(!widget.item.deviceConnected, "the raw device connection state was lost");
+                verify(widget.item.wantVisible, "the bar pill dropped out for a verification reopen");
+                verify(widget.item.advancedAvailable, "the settings controls were disabled by a verification reopen");
+                verify(!widget.item.stale, "a verification reopen dimmed the panel");
+                compare(widget.item.pendingAdvancedFor("press_speed"), null, "the daemon took the request over but the local entry stayed");
+                compare(widget.item.effectiveSetting("press_speed"), "slower", "the control snapped back during the reopen");
+                compare(node("batteryLeft").caption, "", "a verification reopen aged the battery rows");
+                compare(settings().captionFor("press_speed"), "Verifying with AirPods\u2026");
+                verifyStableGeometry("verification reopen");
 
-                snapshot.settings.press_speed = "slower";
-                snapshot.settings_report_seq.press_speed = 2;
-                widget.item.parseState(JSON.stringify(snapshot));
-                compare(widget.item.pendingAdvancedFor("press_speed"), null);
-                verify(!widget.item.advancedReadbackActive);
+                const settled = JSON.parse(JSON.stringify(reopening));
+                settled.device.connected = true;
+                settled.device.aap_link = true;
+                settled.verify_reopen = false;
+                settled.battery.stale = false;
+                settled.settings.press_speed = "slower";
+                settled.settings_status.press_speed = "confirmed";
+                settled.settings_verify = "idle";
+                widget.item.parseState(JSON.stringify(settled));
+                wait(20);
                 compare(widget.item.confirmedSetting("press_speed"), "slower");
-                verifyBatteryGeometry("AAP readback restored");
+                compare(settings().captionFor("press_speed"), "Confirmed");
+                verifyStableGeometry("verification confirmed");
+
+                const kept = JSON.parse(JSON.stringify(settled));
+                kept.settings.press_speed = "default";
+                kept.settings_status.press_speed = "mismatch";
+                widget.item.parseState(JSON.stringify(kept));
+                wait(20);
+                compare(widget.item.effectiveSetting("press_speed"), "default", "a mismatch did not return the control to the value the AirPods kept");
+                compare(settings().captionFor("press_speed"), "AirPods kept Default");
+                compare(String(settings().captionColorFor("press_speed")), String(Theme.error), "a mismatch is not in the error colour");
+                verifyStableGeometry("AirPods kept their own value");
+
+                const unreported = JSON.parse(JSON.stringify(kept));
+                unreported.settings_status.press_speed = "unreported";
+                widget.item.parseState(JSON.stringify(unreported));
+                wait(20);
+                compare(widget.item.effectiveSetting("press_speed"), "slower", "an unreported write was withdrawn from the control");
+                compare(settings().captionFor("press_speed"), "Applied. AirPods 4 doesn't report this setting back.");
+                verifyStableGeometry("AirPods never report this setting");
+
+                const unverified = JSON.parse(JSON.stringify(unreported));
+                unverified.settings_status.press_speed = "unverified";
+                widget.item.parseState(JSON.stringify(unverified));
+                wait(20);
+                compare(settings().captionFor("press_speed"), "Sent, not verified");
+                compare(String(settings().captionColorFor("press_speed")), String(Theme.warning), "an unverified write is not in the warning colour");
+                verifyStableGeometry("verification could not run");
             } finally {
-                widget.item.advancedReadbackActive = false;
-                widget.item.advancedReadbackSawDown = false;
                 widget.item.parseState(original);
                 Proc.controlled = false;
                 Proc.reset();
@@ -506,7 +551,7 @@ Rectangle {
                     "state": "sending"
                 }
             };
-            compare(node("settingRow_microphone").requestText, "Pending");
+            compare(node("settingRow_microphone").requestText, "Waiting\u2026");
             compare(node("settingRow_press_speed").requestText, "Sending…");
             verify(confirmed.confirmedSelected && !confirmed.selected, "confirmed microphone was not kept separate from a request");
             verify(requested.requestedSelected && requested.selected, "requested microphone target was not selected immediately");
@@ -532,7 +577,7 @@ Rectangle {
                 compare(node("aurisAdvancedFeedbackSlot").height, fixed.feedbackHeight, label + ": feedback slot changed");
             }
 
-            for (const state of ["sending", "awaiting", "verifying", "unconfirmed"]) {
+            for (const state of ["sending", "awaiting", "verifying"]) {
                 setup.pendingRequests = {
                     "microphone": {
                         "target": "left",
@@ -570,7 +615,21 @@ Rectangle {
             verifyFixedGeometry("rename validation");
             renameField.text = setup.deviceName;
 
-            widget.item.showAdvancedToast("warning", "Sent; no device report yet.");
+            const captionKeys = ["microphone", "press_speed", "hold_duration", "listening_mode_cycle", "call_controls", "personalized_volume"];
+            for (const text of ["Verifying with AirPods\u2026", "Applied. AirPods 4 doesn't report this setting back.", ""]) {
+                const captions = {};
+                for (const key of captionKeys)
+                    captions[key] = {
+                        "text": text,
+                        "color": Theme.error
+                    };
+                setup.captions = captions;
+                wait(20);
+                verifyFixedGeometry("caption \"" + text + "\"");
+            }
+            setup.captions = {};
+
+            widget.item.showAdvancedToast("warning", "Sent, not verified.");
             const toast = node("aurisAdvancedToast");
             verify(toast !== null && toast.visible);
             compare(toast.opacity, 1);
@@ -589,6 +648,385 @@ Rectangle {
             compare(toast.opacity, 0);
             verifyFixedGeometry("toast dismissed");
             setup.pendingRequests = {};
+            setup.captions = {};
+        }
+
+        function test_06_seamless_switching() {
+            const w = widget.item;
+            const original = JSON.stringify(w.st);
+            const snap = JSON.parse(original);
+            const parse = () => {
+                w.parseState(JSON.stringify(snap));
+                settle();
+            };
+            Proc.controlled = true;
+            Proc.reset();
+            try {
+                const slot = node("aurisHandoffSlot");
+                const toggle = node("aurisHandoffToggle");
+                const appleCaption = node("aurisHandoffAppleIdCaption");
+                const rowText = node("aurisHandoffText");
+                const useHere = node("aurisHandoffUseHere");
+                verify(slot && toggle && appleCaption && rowText && useHere, "seamless switching controls missing");
+                node("aurisTechnicalDisclosure").expanded = true;
+
+                // Missing: an older daemon. Nothing new is usable or shown.
+                parse();
+                compare(w.handoff, null);
+                compare(settings().handoff, null);
+                verify(!toggle.enabled, "toggle usable without a handoff object");
+                verify(!appleCaption.visible);
+                compare(slot.height, 0);
+                verify(!settings().submitHandoff(true));
+                compare(Proc.calls.length, 0);
+
+                // Disabled, without the Apple host ID.
+                snap.handoff = {
+                    "enabled": false,
+                    "take_over_on_play": true,
+                    "apple_host_id": false,
+                    "owner": "unknown",
+                    "audio_source": null,
+                    "devices": [],
+                    "last_event": null
+                };
+                parse();
+                verify(toggle.enabled);
+                verify(!toggle.checked);
+                verify(appleCaption.visible, "missing Apple ID caption");
+                compare(appleCaption.text, "Needs the Apple Bluetooth ID. See the README.");
+                compare(appleCaption.color, Theme.warning);
+                compare(slot.height, 0);
+                toggle.toggled(true);
+                compare(Proc.calls.length, 1);
+                compare(Proc.calls[0].argv.slice(-2).join("|"), "handoff|on");
+                snap.handoff.enabled = true;
+                snap.handoff.apple_host_id = true;
+                parse();
+                verify(toggle.checked);
+                verify(!appleCaption.visible);
+                toggle.toggled(false);
+                compare(Proc.calls[1].argv.slice(-2).join("|"), "handoff|off");
+                node("aurisTechnicalDisclosure").expanded = false;
+                settle();
+
+                // Another device is playing: A2DP has gone, the AAP link stays.
+                const fixedY = node("aurisQuickControls").y;
+                snap.device.connected = false;
+                snap.handoff.owner = "other";
+                snap.handoff.audio_source = {
+                    "address": "AA:BB:CC:DD:EE:01",
+                    "is_local": false,
+                    "state": "media"
+                };
+                snap.handoff.devices = [
+                    {
+                        "address": "AA:BB:CC:DD:EE:02",
+                        "is_local": true
+                    },
+                    {
+                        "address": "AA:BB:CC:DD:EE:01",
+                        "is_local": false
+                    }
+                ];
+                parse();
+                verify(w.connected, "a handed-off AAP link read as a disconnect");
+                verify(w.wantVisible, "pill hid while the AirPods were on another device");
+                compare(slot.height, node("aurisHandoffCard").height + Theme.spacingS);
+                compare(rowText.text, "Playing on another device");
+                verify(useHere.visible);
+                verify(useHere.x >= 0 && useHere.x + useHere.width <= useHere.parent.width + 0.1, "Use here outside its row: x " + useHere.x + " w " + useHere.width + " row " + useHere.parent.width + " card " + node("aurisHandoffCard").width);
+                checkButton(useHere);
+                compare(node("aurisQuickControls").y, fixedY);
+                const before = Proc.calls.length;
+                mouseClick(useHere);
+                tryVerify(() => Proc.calls.length === before + 1, 1000, "Use here never reached the command runner");
+                compare(Proc.calls[before].argv[Proc.calls[before].argv.length - 1], "take-over");
+
+                snap.handoff.audio_source.state = "call";
+                parse();
+                compare(rowText.text, "On a call on another device");
+                snap.handoff.audio_source.state = "idle";
+                parse();
+                compare(slot.height, 0);
+
+                // Local owner with another device known: nothing extra.
+                snap.device.connected = true;
+                snap.handoff.owner = "local";
+                snap.handoff.audio_source = {
+                    "address": "AA:BB:CC:DD:EE:02",
+                    "is_local": true,
+                    "state": "media"
+                };
+                parse();
+                verify(!w.handoffCardVisible);
+                compare(slot.height, 0);
+
+                const captions = [["yielded", "Moved to your other device"], ["took_over", "Moved here"], ["yield_requested", "Handing off\u2026"]];
+                for (let i = 0; i < captions.length; i++) {
+                    snap.handoff.last_event = {
+                        "kind": captions[i][0],
+                        "at": new Date(Date.now() + i).toISOString(),
+                        "peer": "AA:BB:CC:DD:EE:01"
+                    };
+                    parse();
+                    compare(w.handoffCaption, captions[i][1]);
+                    compare(rowText.text, captions[i][1]);
+                    verify(slot.height > 0);
+                    verify(!useHere.visible);
+                }
+                const cardHeight = node("aurisHandoffCard").height;
+                tryVerify(() => w.handoffCaption === "", 5000, "handoff caption never retired");
+                tryCompare(slot, "height", 0);
+                compare(node("aurisHandoffCard").height, cardHeight);
+                // The same event arriving again is not news.
+                parse();
+                compare(w.handoffCaption, "");
+            } finally {
+                node("aurisTechnicalDisclosure").expanded = false;
+                w.parseState(original);
+                Proc.controlled = false;
+                Proc.reset();
+            }
+        }
+
+        // The daemon can spend several seconds rejoining the AirPods after a
+        // bud role switch, an eviction or a Low Energy wake. The module has to
+        // stay on screen and say what it is waiting for, because disappearing
+        // is indistinguishable from the AirPods having been put away.
+        function test_07_link_healing_keeps_the_module_on_screen() {
+            const w = widget.item;
+            const original = JSON.stringify(w.st);
+            const snap = JSON.parse(original);
+            const since = new Date().toISOString();
+            const parse = () => {
+                w.parseState(JSON.stringify(snap));
+                settle();
+            };
+            const reconnect = (reason, attempt) => {
+                snap.link = {
+                    "status": "reconnecting",
+                    "reason": reason,
+                    "attempt": attempt,
+                    "since": since
+                };
+            };
+            Proc.controlled = true;
+            Proc.reset();
+            try {
+                const slot = node("aurisLinkSlot");
+                const row = node("aurisLinkText");
+                verify(slot && row, "link status row missing");
+
+                // Absent: an older daemon. Everything reads as it did before
+                // the field existed.
+                delete snap.link;
+                parse();
+                compare(w.link, null);
+                compare(w.linkStatus, "");
+                verify(!w.linkReconnecting, "a missing link object was read as reconnecting");
+                compare(w.linkStatusText, "");
+                compare(slot.height, 0);
+                verify(w.connected && w.moduleShouldShow && w.wantVisible);
+                verify(!w.disconnectGrace);
+                compare(w.barContentOpacity, 1);
+                verify(!w.cellDim("left") && !w.cellDim("right") && !w.cellDim("case"));
+
+                // A pending write waits for the answer instead of being
+                // cancelled, exactly as it does through a verification reopen.
+                node("aurisTechnicalDisclosure").expanded = true;
+                settle();
+                mouseClick(node("settingChoice_press_speed_1"));
+                tryVerify(() => Proc.calls.length === 1);
+                Proc.complete(0, '{"ok":true}', 0);
+                compare(w.pendingAdvancedFor("press_speed").state, "awaiting");
+                snap.device.connected = false;
+                snap.device.aap_link = false;
+                reconnect("link_lost", 1);
+                parse();
+                verify(w.pendingAdvancedFor("press_speed") !== null, "a scheduled reconnect cancelled a pending write");
+                compare(w.pendingAdvancedFor("press_speed").state, "awaiting");
+                node("aurisTechnicalDisclosure").expanded = false;
+                settle();
+
+                // Reconnecting: visible, dimmed, and one neutral line. The
+                // daemon's reason is a guess at a cause, so it never reaches
+                // the screen; every reason reads the same.
+                const reasons = ["bud_switch", "taken_over", "link_lost", "auto_connect"];
+                const caption = "Attempting to reconnect";
+                for (const reason of reasons) {
+                    reconnect(reason, 1);
+                    parse();
+                    verify(w.linkReconnecting, reason + ": not read as reconnecting");
+                    verify(!w.deviceConnected, reason + ": the raw device state was lost");
+                    verify(w.connected, reason + ": a reconnect was rendered as a disconnect");
+                    verify(w.moduleShouldShow && w.wantVisible, reason + ": the module hid itself while the link was healing");
+                    verify(!w.disconnectGrace, reason + ": an announced reconnect fell back to the grace");
+                    compare(w.linkReason, reason, reason + ": the daemon's reason was lost");
+                    compare(w.linkStatusText, caption);
+                    compare(row.text, caption);
+                    verify(slot.height > 0, reason + ": the status row stayed closed");
+                    verify(w.barContentOpacity < 1, reason + ": the bar icon was left untouched");
+                    verify(w.stale, reason + ": held readings were not marked stale");
+                    verify(w.cellDim("left") && w.cellDim("right") && w.cellDim("case"), reason + ": held readings were not dimmed");
+                    compare(node("batteryLeft").level, 85, reason + ": the left row lost its last reading");
+                    compare(node("batteryRight").level, 90, reason + ": the right row lost its last reading");
+                    compare(node("batteryCase").level, 75, reason + ": the case row lost its last reading");
+                    verify(node("batteryLeft").dim && node("batteryRight").dim && node("batteryCase").dim, reason + ": a battery row rendered as live");
+                }
+
+                // The attempt is only worth reading once a first try failed,
+                // and it is the only thing appended to the caption.
+                reconnect("link_lost", 2);
+                parse();
+                compare(w.linkStatusText, caption + " \u00b7 attempt 2");
+                compare(row.text, caption + " \u00b7 attempt 2");
+                reconnect(null, 2);
+                parse();
+                compare(w.linkStatusText, caption + " \u00b7 attempt 2");
+                reconnect(null, 1);
+                parse();
+                compare(w.linkStatusText, caption);
+                reconnect(null, 0);
+                parse();
+                compare(w.linkStatusText, caption);
+
+                // Given up: held on screen for the grace, then gone.
+                snap.link = {
+                    "status": "disconnected",
+                    "reason": "link_lost",
+                    "attempt": 3,
+                    "since": since
+                };
+                parse();
+                verify(!w.connected, "a finished disconnect still read as connected");
+                verify(!w.linkReconnecting);
+                compare(w.linkStatusText, "");
+                verify(w.disconnectGrace, "the disconnect grace never started");
+                verify(w.moduleShouldShow, "the module vanished the instant the link dropped");
+                tryCompare(slot, "height", 0);
+                tryVerify(() => !w.disconnectGrace, 4000, "the disconnect grace never expired");
+                verify(!w.moduleShouldShow, "the module stayed on screen after the grace");
+
+                // An unexplained disconnect from an older daemon gets the same
+                // grace, with no link object anywhere.
+                snap.device.connected = true;
+                snap.device.aap_link = true;
+                delete snap.link;
+                parse();
+                verify(w.connected && w.moduleShouldShow && !w.disconnectGrace);
+                snap.device.connected = false;
+                snap.device.aap_link = false;
+                parse();
+                verify(!w.connected, "an old-daemon disconnect was read as connected");
+                verify(w.disconnectGrace, "an unexplained disconnect got no grace");
+                verify(w.moduleShouldShow, "an unexplained disconnect hid the module immediately");
+                tryVerify(() => !w.moduleShouldShow, 4000, "the module stayed on screen after the grace");
+
+                // Back: the line goes away and the readings are live again.
+                snap.device.connected = true;
+                snap.device.aap_link = true;
+                snap.link = {
+                    "status": "connected",
+                    "reason": null,
+                    "attempt": 0,
+                    "since": since
+                };
+                parse();
+                verify(w.connected && w.moduleShouldShow && w.wantVisible);
+                verify(!w.disconnectGrace, "the grace outlived the reconnection");
+                compare(w.linkStatusText, "");
+                compare(w.barContentOpacity, 1);
+                verify(!w.stale, "a healed link left the readings dimmed");
+                verify(!w.cellDim("left") && !w.cellDim("right") && !w.cellDim("case"));
+                tryCompare(slot, "height", 0);
+            } finally {
+                node("aurisTechnicalDisclosure").expanded = false;
+                w.parseState(original);
+                Proc.controlled = false;
+                Proc.reset();
+            }
+        }
+
+        // An open panel used to outlive the AirPods: the bar module fell back
+        // to the plain Bluetooth icon and then hid itself, while the popout
+        // went on offering controls for a device that was back in its case.
+        function test_08_panel_closes_once_the_airpods_are_gone() {
+            const w = widget.item;
+            const original = JSON.stringify(w.st);
+            const snap = JSON.parse(original);
+            const since = new Date().toISOString();
+            const parse = () => {
+                w.parseState(JSON.stringify(snap));
+                settle();
+            };
+            try {
+                host.shouldBeVisible = true;
+                settle();
+                compare(w.popoutRef, host, "the panel never handed its host popout up");
+                verify(w.panelOpen, "an open panel was not read as open");
+                verify(!w.panelShouldClose, "a connected device asked for the panel to close");
+                const closes = w.closePopoutCount;
+
+                // Healing the link holds the panel open right through the
+                // grace: that is the moment the controls are most wanted.
+                snap.device.connected = false;
+                snap.device.aap_link = false;
+                snap.link = {
+                    "status": "reconnecting",
+                    "reason": "link_lost",
+                    "attempt": 1,
+                    "since": since
+                };
+                parse();
+                verify(w.panelHeldOpen, "a reconnect was not read as a held link");
+                verify(!w.panelShouldClose, "a reconnect asked for the panel to close");
+                wait(w.disconnectGraceMs + 400);
+                compare(w.closePopoutCount, closes, "the panel closed while the daemon was still reconnecting");
+                verify(w.panelOpen, "the panel was closed during a reconnect");
+
+                // A settings read-back reopen is not a disconnect.
+                delete snap.link;
+                snap.verify_reopen = true;
+                parse();
+                verify(w.verifyReopen && !w.panelShouldClose, "a verification reopen asked for the panel to close");
+                delete snap.verify_reopen;
+
+                // Neither is audio simply playing on another host.
+                snap.device.aap_link = true;
+                snap.handoff = Object.assign({}, snap.handoff, {
+                    "owner": "other",
+                    "audio_source": {
+                        "address": "AA:BB:CC:DD:EE:01",
+                        "is_local": false,
+                        "state": "media"
+                    }
+                });
+                parse();
+                verify(w.handoffHeldElsewhere && !w.panelShouldClose, "a handoff asked for the panel to close");
+                compare(w.closePopoutCount, closes, "the panel closed without a disconnect");
+
+                // Gone: held for the grace, then closed with the module.
+                snap.handoff.owner = "local";
+                snap.device.aap_link = false;
+                snap.link = {
+                    "status": "disconnected",
+                    "reason": "link_lost",
+                    "attempt": 3,
+                    "since": since
+                };
+                parse();
+                verify(!w.connected && w.disconnectGrace, "a dropped link skipped the grace");
+                verify(!w.panelShouldClose, "the panel was given up on inside the grace");
+                compare(w.closePopoutCount, closes, "the panel closed before the grace expired");
+                tryVerify(() => !w.moduleShouldShow, 4000, "the module stayed on screen after the grace");
+                verify(w.panelShouldClose, "the module hid itself with the panel still held open");
+                compare(w.closePopoutCount, closes + 1, "the panel was left open after the AirPods went away");
+            } finally {
+                host.shouldBeVisible = true;
+                w.parseState(original);
+                settle();
+            }
         }
     }
 }

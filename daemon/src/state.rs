@@ -1,4 +1,4 @@
-//! `Snapshot` is the frozen state.json schema v1. The field names and the
+//! `Snapshot` is the frozen state.json schema v2. The field names and the
 //! string values of every enum here are part of the contract with the plugin;
 //! `serde_round_trip_matches_contract_keys` guards them.
 
@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::{CallControls, DeviceSettings, HoldDuration, MicrophoneMode, PressSpeed};
 
-/// state.json schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+/// state.json schema version. Bumped to 2 by the additive `link` object;
+/// every schema-1 field kept its name and meaning.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Daemon version reported in `daemon.version`.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -205,8 +206,193 @@ pub struct Ear {
     pub right: EarState,
 }
 
-/// The whole state.json document.
+/// Current value of [`Snapshot::settings_api`]. Version 2 added the
+/// requested/status/verify fields that describe a settings readback. Version 3
+/// put the accessory name under [`NAME_KEY`] in those same maps, so a rename is
+/// verified and reported exactly like any other setting.
+pub const SETTINGS_API: u32 = 3;
+
+/// Key used for the accessory name inside `settings_requested` and
+/// `settings_status`. It is not a [`crate::settings::SettingCommand`] key: the
+/// requested value is the name that was written, and the reported value is
+/// `device.name` as the accessory itself gave it in its 0x1D metadata.
+pub const NAME_KEY: &str = "name";
+
+/// `settings_status` value: written, readback in progress.
+pub const STATUS_VERIFYING: &str = "verifying";
+/// `settings_status` value: a fresh dump reported the requested value.
+pub const STATUS_CONFIRMED: &str = "confirmed";
+/// `settings_status` value: a fresh dump reported a different value.
+pub const STATUS_MISMATCH: &str = "mismatch";
+/// `settings_status` value: readback ran, but this model never reports the key.
+pub const STATUS_UNREPORTED: &str = "unreported";
+/// `settings_status` value: the readback could not run.
+pub const STATUS_UNVERIFIED: &str = "unverified";
+
+/// `settings_verify` value: no readback is pending.
+pub const VERIFY_IDLE: &str = "idle";
+/// `settings_verify` value: a write is waiting out the debounce.
+pub const VERIFY_SCHEDULED: &str = "scheduled";
+/// `settings_verify` value: the AAP link is being reopened for readback.
+pub const VERIFY_REOPENING: &str = "reopening";
+
+fn verify_idle() -> String {
+    VERIFY_IDLE.to_owned()
+}
+
+/// Who the AirPods say owns their audio connection.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HandoffOwner {
+    /// This host.
+    Local,
+    /// Another host (Mac, iPhone, iPad).
+    Other,
+    /// Not reported since the AAP link opened.
+    #[default]
+    Unknown,
+}
+
+/// What the host in an audio-source report is doing.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioSourceStatus {
+    /// Nothing routed.
+    Idle,
+    /// A call.
+    Call,
+    /// Media playback.
+    Media,
+}
+
+/// The host the AirPods currently route audio for.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HandoffAudioSource {
+    /// `AA:BB:CC:DD:EE:FF`.
+    pub address: String,
+    /// Whether it is this machine's adapter.
+    pub is_local: bool,
+    /// Idle, call or media.
+    pub state: AudioSourceStatus,
+}
+
+/// One host in the AirPods' connected-devices list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HandoffDevice {
+    /// `AA:BB:CC:DD:EE:FF`.
+    pub address: String,
+    /// Whether it is this machine's adapter.
+    pub is_local: bool,
+}
+
+/// Kind of the most recent handoff action.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffEventKind {
+    /// Audio released because another host is playing, or on `yield`.
+    Yielded,
+    /// Audio claimed on local playback or `take_over`.
+    TookOver,
+    /// Audio released because another host asked for it over smart routing.
+    YieldRequested,
+}
+
+/// The most recent handoff action.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HandoffEvent {
+    /// What happened.
+    pub kind: HandoffEventKind,
+    /// RFC3339 timestamp.
+    pub at: String,
+    /// The other host involved, when known.
+    pub peer: Option<String>,
+}
+
+/// Apple multi-host switching state. Always present in state.json.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct Handoff {
+    /// `[handoff] enabled`: automatic yield and take-over.
+    pub enabled: bool,
+    /// `[handoff] take_over_on_play`.
+    pub take_over_on_play: bool,
+    /// Local adapter Modalias names Apple (`bluetooth:v004C...`); `null` when
+    /// unreadable.
+    pub apple_host_id: Option<bool>,
+    /// Ownership as last reported or claimed.
+    pub owner: HandoffOwner,
+    /// Last audio-source report, `null` before one arrives on this link.
+    pub audio_source: Option<HandoffAudioSource>,
+    /// Last connected-devices report.
+    pub devices: Vec<HandoffDevice>,
+    /// Most recent yield or take-over.
+    pub last_event: Option<HandoffEvent>,
+}
+
+impl Default for Handoff {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            take_over_on_play: true,
+            apple_host_id: None,
+            owner: HandoffOwner::Unknown,
+            audio_source: None,
+            devices: Vec::new(),
+            last_event: None,
+        }
+    }
+}
+
+/// Whether the classic link is up, coming back, or gone.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkStatus {
+    /// `device.connected` is true.
+    Connected,
+    /// A rejoin or auto-connect sequence is waiting or connecting. The UI
+    /// should keep the device on screen: the link is expected back.
+    Reconnecting,
+    /// No link and nothing trying to get one back.
+    #[default]
+    Disconnected,
+}
+
+/// Why a reconnect sequence is running. `null` unless
+/// [`LinkStatus::Reconnecting`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkReason {
+    /// The primary bud role moved shortly before the drop: the AirPods cut
+    /// this host while swapping which bud carries the radio link.
+    BudSwitch,
+    /// An Apple host took the AirPods over.
+    TakenOver,
+    /// A link supervision timeout took this host's link.
+    LinkLost,
+    /// Proximity auto-connect is bringing the AirPods back.
+    AutoConnect,
+}
+
+/// Link health as the widget needs it: a self-healing reconnect must not look
+/// like a real disconnect. Always present in state.json.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct Link {
+    /// Connected, reconnecting or disconnected.
+    pub status: LinkStatus,
+    /// Why the reconnect is running; `null` in the other two statuses.
+    pub reason: Option<LinkReason>,
+    /// `Device1.Connect` calls started in the current sequence. `0` while the
+    /// sequence is only scheduled.
+    pub attempt: u32,
+    /// When the current sequence started, RFC3339 in UTC; `null` without one.
+    pub since: Option<String>,
+}
+
+/// The whole state.json document.
+///
+/// `Eq` is deliberately absent: `settings_requested` holds arbitrary JSON.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Snapshot {
     /// Schema version, always [`SCHEMA_VERSION`].
     pub schema: u32,
@@ -238,6 +424,29 @@ pub struct Snapshot {
     /// value, so unrelated battery snapshots cannot be mistaken for an echo.
     #[serde(default)]
     pub settings_report_seq: std::collections::BTreeMap<String, u64>,
+    /// Last value written per key in this daemon lifetime, in the same JSON
+    /// shape `settings` uses for that key. Survives link loss.
+    #[serde(default)]
+    pub settings_requested: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Readback outcome per requested key: `verifying`, `confirmed`,
+    /// `mismatch`, `unreported` or `unverified`.
+    #[serde(default)]
+    pub settings_status: std::collections::BTreeMap<String, String>,
+    /// Global readback phase: `idle`, `scheduled` or `reopening`.
+    #[serde(default = "verify_idle")]
+    pub settings_verify: String,
+    /// True while the AAP link is being reopened purely to read settings back.
+    /// `connected`/`aap_link` may drop during that window; the UI keeps showing
+    /// the device as connected.
+    #[serde(default)]
+    pub verify_reopen: bool,
+    /// Apple multi-host switching. Missing in older snapshots.
+    #[serde(default)]
+    pub handoff: Handoff,
+    /// Link health, including self-healing reconnects. Missing in schema-1
+    /// snapshots, where it reads as `disconnected`.
+    #[serde(default)]
+    pub link: Link,
 }
 
 impl Default for Snapshot {
@@ -256,9 +465,15 @@ impl Default for Snapshot {
             noise_control: NoiseControl::Unknown,
             conversational_awareness: None,
             adaptive_level: None,
-            settings_api: 1,
+            settings_api: SETTINGS_API,
             settings: DeviceSettings::default(),
             settings_report_seq: Default::default(),
+            settings_requested: Default::default(),
+            settings_status: Default::default(),
+            settings_verify: verify_idle(),
+            verify_reopen: false,
+            handoff: Handoff::default(),
+            link: Link::default(),
         }
     }
 }
@@ -334,7 +549,7 @@ impl Snapshot {
             noise_control: NoiseControl::Anc,
             conversational_awareness: Some(false),
             adaptive_level: Some(50),
-            settings_api: 1,
+            settings_api: SETTINGS_API,
             settings: DeviceSettings {
                 microphone: Some(MicrophoneMode::Auto),
                 press_speed: Some(PressSpeed::Default),
@@ -348,6 +563,48 @@ impl Snapshot {
                 personalized_volume: Some(true),
             },
             settings_report_seq: Default::default(),
+            settings_requested: std::collections::BTreeMap::from([(
+                "press_speed".to_owned(),
+                serde_json::json!("default"),
+            )]),
+            settings_status: std::collections::BTreeMap::from([(
+                "press_speed".to_owned(),
+                STATUS_CONFIRMED.to_owned(),
+            )]),
+            settings_verify: verify_idle(),
+            verify_reopen: false,
+            handoff: Handoff {
+                enabled: true,
+                take_over_on_play: true,
+                apple_host_id: Some(true),
+                owner: HandoffOwner::Other,
+                audio_source: Some(HandoffAudioSource {
+                    address: "A4:83:E7:00:11:22".to_owned(),
+                    is_local: false,
+                    state: AudioSourceStatus::Media,
+                }),
+                devices: vec![
+                    HandoffDevice {
+                        address: "5C:F3:70:0D:0E:0F".to_owned(),
+                        is_local: true,
+                    },
+                    HandoffDevice {
+                        address: "A4:83:E7:00:11:22".to_owned(),
+                        is_local: false,
+                    },
+                ],
+                last_event: Some(HandoffEvent {
+                    kind: HandoffEventKind::Yielded,
+                    at: crate::now_rfc3339(),
+                    peer: Some("A4:83:E7:00:11:22".to_owned()),
+                }),
+            },
+            link: Link {
+                status: LinkStatus::Connected,
+                reason: None,
+                attempt: 0,
+                since: None,
+            },
         }
     }
 }
@@ -374,13 +631,19 @@ mod tests {
                 "daemon",
                 "device",
                 "ear",
+                "handoff",
                 "lid",
+                "link",
                 "noise_control",
                 "schema",
                 "settings",
                 "settings_api",
                 "settings_report_seq",
+                "settings_requested",
+                "settings_status",
+                "settings_verify",
                 "updated_at",
+                "verify_reopen",
             ]
         );
 
@@ -452,7 +715,7 @@ mod tests {
         ear_keys.sort_unstable();
         assert_eq!(ear_keys, ["left", "right"]);
 
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["daemon"]["source"], "aap");
         assert_eq!(json["device"]["model_id"], "201B");
         assert_eq!(json["battery"]["left"]["level"], 87);
@@ -461,9 +724,15 @@ mod tests {
         assert_eq!(json["ear"]["right"], "out");
         assert_eq!(json["noise_control"], "anc");
         assert_eq!(json["lid"], "unknown");
-        assert_eq!(json["settings_api"], 1);
+        assert_eq!(json["settings_api"], 3);
         assert_eq!(json["settings"]["microphone"], "auto");
+        assert_eq!(json["settings_requested"]["press_speed"], "default");
+        assert_eq!(json["settings_status"]["press_speed"], "confirmed");
+        assert_eq!(json["settings_verify"], "idle");
+        assert_eq!(json["verify_reopen"], false);
         assert_eq!(json["settings"]["call_controls"], "mute_once_hangup_twice");
+        assert_eq!(json["link"]["status"], "connected");
+        assert!(json["link"]["reason"].is_null());
 
         let back: Snapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snap);
@@ -478,8 +747,11 @@ mod tests {
         assert!(json["device"]["model"].is_null());
         assert!(json["conversational_awareness"].is_null());
         assert!(json["adaptive_level"].is_null());
-        assert_eq!(json["settings_api"], 1);
+        assert_eq!(json["settings_api"], 3);
         assert!(json["settings"]["microphone"].is_null());
+        assert_eq!(json["settings_verify"], "idle");
+        assert_eq!(json["verify_reopen"], false);
+        assert!(json["settings_requested"].as_object().unwrap().is_empty());
         assert_eq!(json["battery"]["stale"], true);
         assert_eq!(json["device"]["connected"], false);
         assert_eq!(json["daemon"]["source"], "none");
@@ -504,10 +776,18 @@ mod tests {
         let obj = json.as_object_mut().unwrap();
         obj.remove("settings_api");
         obj.remove("settings");
+        obj.remove("settings_requested");
+        obj.remove("settings_status");
+        obj.remove("settings_verify");
+        obj.remove("verify_reopen");
 
         let snapshot: Snapshot = serde_json::from_value(json).unwrap();
         assert_eq!(snapshot.settings_api, 0);
         assert_eq!(snapshot.settings, DeviceSettings::default());
+        assert!(snapshot.settings_requested.is_empty());
+        assert!(snapshot.settings_status.is_empty());
+        assert_eq!(snapshot.settings_verify, VERIFY_IDLE);
+        assert!(!snapshot.verify_reopen);
     }
 
     #[test]
@@ -535,5 +815,137 @@ mod tests {
         assert_eq!(snapshot.settings.microphone, Some(MicrophoneMode::Left));
         assert_eq!(snapshot.settings.press_speed, None);
         assert_eq!(snapshot.settings.call_controls, None);
+    }
+}
+
+#[cfg(test)]
+mod handoff_contract_tests {
+    use super::*;
+
+    #[test]
+    fn handoff_object_matches_the_frozen_contract() {
+        let json = serde_json::to_value(Snapshot::example()).unwrap();
+        let h = &json["handoff"];
+        let mut keys: Vec<&str> = h.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "apple_host_id",
+                "audio_source",
+                "devices",
+                "enabled",
+                "last_event",
+                "owner",
+                "take_over_on_play"
+            ]
+        );
+        assert_eq!(h["owner"], "other");
+        assert_eq!(h["audio_source"]["state"], "media");
+        assert_eq!(h["audio_source"]["is_local"], false);
+        assert_eq!(h["devices"][0]["is_local"], true);
+        assert_eq!(h["last_event"]["kind"], "yielded");
+        for (kind, wire) in [
+            (HandoffEventKind::TookOver, "took_over"),
+            (HandoffEventKind::YieldRequested, "yield_requested"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn default_handoff_is_present_with_nulls() {
+        let json = serde_json::to_value(Snapshot::initial("")).unwrap();
+        assert_eq!(
+            json["handoff"],
+            serde_json::json!({
+                "enabled": false,
+                "take_over_on_play": true,
+                "apple_host_id": null,
+                "owner": "unknown",
+                "audio_source": null,
+                "devices": [],
+                "last_event": null
+            })
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_handoff_still_loads() {
+        let mut json = serde_json::to_value(Snapshot::initial("")).unwrap();
+        json.as_object_mut().unwrap().remove("handoff");
+        let snap: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.handoff, Handoff::default());
+    }
+}
+
+#[cfg(test)]
+mod link_contract_tests {
+    use super::*;
+
+    #[test]
+    fn link_object_matches_the_frozen_contract() {
+        let json = serde_json::to_value(Snapshot::example()).unwrap();
+        let link = &json["link"];
+        let mut keys: Vec<&str> = link
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["attempt", "reason", "since", "status"]);
+        assert_eq!(link["status"], "connected");
+        assert!(link["reason"].is_null());
+        assert_eq!(link["attempt"], 0);
+        assert!(link["since"].is_null());
+    }
+
+    #[test]
+    fn link_enum_spellings_are_the_contract() {
+        for (status, wire) in [
+            (LinkStatus::Connected, "connected"),
+            (LinkStatus::Reconnecting, "reconnecting"),
+            (LinkStatus::Disconnected, "disconnected"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), wire);
+        }
+        for (reason, wire) in [
+            (LinkReason::BudSwitch, "bud_switch"),
+            (LinkReason::TakenOver, "taken_over"),
+            (LinkReason::LinkLost, "link_lost"),
+            (LinkReason::AutoConnect, "auto_connect"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn a_reconnecting_link_serialises_every_field() {
+        let mut snap = Snapshot::initial("AC:DE:48:00:11:22");
+        snap.link = Link {
+            status: LinkStatus::Reconnecting,
+            reason: Some(LinkReason::BudSwitch),
+            attempt: 1,
+            since: Some("2026-09-16T02:01:47Z".to_owned()),
+        };
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["link"]["status"], "reconnecting");
+        assert_eq!(json["link"]["reason"], "bud_switch");
+        assert_eq!(json["link"]["attempt"], 1);
+        assert_eq!(json["link"]["since"], "2026-09-16T02:01:47Z");
+        let back: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.link, snap.link);
+    }
+
+    #[test]
+    fn a_schema_one_snapshot_without_link_still_loads() {
+        let mut json = serde_json::to_value(Snapshot::initial("")).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("link");
+        obj.insert("schema".to_owned(), serde_json::json!(1));
+        let snap: Snapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(snap.link, Link::default());
+        assert_eq!(snap.link.status, LinkStatus::Disconnected);
     }
 }

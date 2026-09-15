@@ -36,10 +36,25 @@ aes = "0.8"
 toml = "0.8"
 dirs = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Same D-Bus stack bluer already links; used for MPRIS on the session bus.
+dbus = { version = "0.9", features = ["futures"] }
+dbus-tokio = "0.7"
+# Comment-preserving edits of config.toml (`auris handoff on|off`).
+toml_edit = "0.22"
 
 [dependencies.tokio]
 version = "1"
-features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "fs"]
+features = [
+    "rt",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+    "process",
+]
 
 [dependencies.bluer]
 version = "0.17"

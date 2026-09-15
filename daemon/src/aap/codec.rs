@@ -5,6 +5,8 @@
 //! re-framing and no length prefix to honour. Unknown opcodes decode to
 //! [`Packet::Unknown`] and are never an error.
 
+use bluer::Address;
+
 use super::opcode as op;
 use crate::settings::{
     validate_name, CallControls, HoldDuration, MicrophoneMode, PressSpeed, SettingCommand,
@@ -86,6 +88,8 @@ pub enum ControlState {
     AdaptiveLevel(u8),
     /// A typed setting confirmed by the accessory.
     Setting(SettingCommand),
+    /// Control 0x06: whether this host owns the audio connection.
+    OwnsConnection(bool),
     /// A control identifier this version does not model.
     Other {
         /// Control identifier byte.
@@ -93,6 +97,68 @@ pub enum ControlState {
         /// Raw value byte.
         value: u8,
     },
+}
+
+/// Status byte of an audio-source report (opcode 0x000E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSourceState {
+    /// 0x00: nothing is routed.
+    Idle,
+    /// 0x01: a call.
+    Call,
+    /// 0x02: media playback.
+    Media,
+    /// Any other value, kept raw.
+    Other(u8),
+}
+
+impl AudioSourceState {
+    const fn from_wire(v: u8) -> Self {
+        match v {
+            0x00 => Self::Idle,
+            0x01 => Self::Call,
+            0x02 => Self::Media,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// Value of [`ConnectedDevice::info`] byte 0 for a host whose link to the
+/// accessory is up. See [`ConnectedDevice::is_link_up`] for the evidence.
+pub const LINK_UP: u8 = 0x02;
+
+/// One host listed in a connected-devices report (opcode 0x002E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectedDevice {
+    /// Host address. Unlike 0x000C/0x000E this is sent in display order.
+    pub address: Address,
+    /// Two trailing bytes per host. Byte 0 is the host's link state, see
+    /// [`ConnectedDevice::is_link_up`]. Byte 1 is not established.
+    pub info: [u8; 2],
+}
+
+impl ConnectedDevice {
+    /// Whether this host's link to the accessory is up right now.
+    ///
+    /// The AirPods keep a recently disconnected host in the 0x002E list, so
+    /// being listed says nothing. Info byte 0 does: it lines up with the
+    /// other side's own connection log (`TipiTableEvent ... Conn
+    /// Connected|Disconnected`), byte for byte:
+    ///
+    /// * `0x00` listed, link down. The reports carrying `00 15` then `00 05`
+    ///   for a host follow shortly after that host logs `Conn Disconnected`,
+    ///   both while that host is away.
+    /// * `0x01` connecting. `01 05` appears a few seconds before that host's
+    ///   `Conn Connected`; `01 01` for this host appears while it is
+    ///   reconnecting, turning into `02 ..` within about 80 ms.
+    /// * `0x02` link up. `02 17` (or similar) appears within a few
+    ///   milliseconds of the other side's `Conn Connected`.
+    ///
+    /// Byte 1 varies independently (`0x15`/`0x17` for the Mac, `0x01`/`0x03`
+    /// for this host) and is left alone.
+    pub fn is_link_up(&self) -> bool {
+        self.info[0] == LINK_UP
+    }
 }
 
 /// A decoded AAP message.
@@ -119,6 +185,34 @@ pub enum Packet {
     /// the buds applied because the wearer is talking. Low values mean speech
     /// started, high values (>= 0x06) mean it ended. Not the on/off state.
     ConversationalAwarenessLevel(u8),
+    /// Address report (opcode 0x000C): an address and two unexplained bytes.
+    AddressReport {
+        /// Address, already un-reversed.
+        address: Address,
+        /// Trailing bytes, kept raw.
+        extra: [u8; 2],
+    },
+    /// Audio source (opcode 0x000E): which host the accessory routes for.
+    AudioSource {
+        /// Host address, already un-reversed.
+        address: Address,
+        /// What that host is doing.
+        state: AudioSourceState,
+    },
+    /// Connected devices (opcode 0x002E): every host linked to the accessory.
+    ConnectedDevices {
+        /// Two leading bytes, kept raw.
+        header: [u8; 2],
+        /// Hosts in wire order.
+        devices: Vec<ConnectedDevice>,
+    },
+    /// Smart-routing message another host sent via the accessory (0x0011).
+    SmartRouting {
+        /// Sending host, already un-reversed.
+        sender: Address,
+        /// OPACK body, clipped to its declared length.
+        body: Vec<u8>,
+    },
     /// Anything else. Logged at debug and ignored; never an error.
     Unknown {
         /// Little-endian opcode as read from bytes 4..6.
@@ -183,11 +277,66 @@ pub fn decode(buf: &[u8]) -> Result<Packet, DecodeError> {
                 payload[payload.len() - 1],
             ))
         }
+        op::OP_ADDRESS_REPORT => {
+            if payload.len() < 8 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(Packet::AddressReport {
+                address: address_reversed(&payload[..6]),
+                extra: [payload[6], payload[7]],
+            })
+        }
+        op::OP_AUDIO_SOURCE => {
+            if payload.len() < 7 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(Packet::AudioSource {
+                address: address_reversed(&payload[..6]),
+                state: AudioSourceState::from_wire(payload[6]),
+            })
+        }
+        op::OP_CONNECTED_DEVICES => decode_connected_devices(payload),
+        op::OP_SMART_ROUTING_RELAY => {
+            if payload.len() < 8 {
+                return Err(DecodeError::Truncated);
+            }
+            let declared = usize::from(u16::from_le_bytes([payload[6], payload[7]]));
+            let body = &payload[8..];
+            Ok(Packet::SmartRouting {
+                sender: address_reversed(&payload[..6]),
+                body: body[..declared.min(body.len())].to_vec(),
+            })
+        }
         _ => Ok(Packet::Unknown {
             opcode,
             payload: payload.to_vec(),
         }),
     }
+}
+
+/// Address bytes as sent in 0x000C/0x000E/0x0010/0x0011: least significant first.
+fn address_reversed(b: &[u8]) -> Address {
+    Address::new([b[5], b[4], b[3], b[2], b[1], b[0]])
+}
+
+fn decode_connected_devices(payload: &[u8]) -> Result<Packet, DecodeError> {
+    if payload.len() < 3 {
+        return Err(DecodeError::Truncated);
+    }
+    let count = usize::from(payload[2]);
+    // Tolerate a short list the way LibrePods does: keep what is complete.
+    let devices = payload[3..]
+        .chunks_exact(8)
+        .take(count)
+        .map(|c| ConnectedDevice {
+            address: Address::new([c[0], c[1], c[2], c[3], c[4], c[5]]),
+            info: [c[6], c[7]],
+        })
+        .collect();
+    Ok(Packet::ConnectedDevices {
+        header: [payload[0], payload[1]],
+        devices,
+    })
 }
 
 fn decode_control(payload: &[u8]) -> Result<ControlState, DecodeError> {
@@ -216,6 +365,11 @@ fn decode_control(payload: &[u8]) -> Result<ControlState, DecodeError> {
         },
         op::CTL_CONV_AWARENESS => Ok(ControlState::ConversationalAwareness(value == 0x01)),
         op::CTL_ADAPTIVE_LEVEL => Ok(ControlState::AdaptiveLevel(value.min(100))),
+        op::CTL_OWNS_CONNECTION => Ok(match value {
+            0x00 => ControlState::OwnsConnection(false),
+            0x01 => ControlState::OwnsConnection(true),
+            _ => ControlState::Other { id, value },
+        }),
         op::CTL_MICROPHONE if scalar_padding_is_zero => Ok(match value {
             0x00 => ControlState::Setting(SettingCommand::Microphone(MicrophoneMode::Auto)),
             0x01 => ControlState::Setting(SettingCommand::Microphone(MicrophoneMode::Right)),
@@ -355,6 +509,8 @@ pub enum FeaturesVariant {
     D7,
     /// Alternate form: `04 00 04 00 4d 00 0e 00 00 00 00 00 00 00`.
     Alt,
+    /// Full form iOS sends: `04 00 04 00 4d 00 ff 00 00 00 00 00 00 00`.
+    Ff,
 }
 
 /// The opening handshake.
@@ -367,6 +523,7 @@ pub fn encode_set_features(variant: FeaturesVariant) -> Vec<u8> {
     match variant {
         FeaturesVariant::D7 => op::SET_FEATURES_D7.to_vec(),
         FeaturesVariant::Alt => op::SET_FEATURES_ALT.to_vec(),
+        FeaturesVariant::Ff => op::SET_FEATURES_FF.to_vec(),
     }
 }
 
@@ -394,6 +551,145 @@ fn encode_control_data(id: u8, data: &[u8]) -> Vec<u8> {
 
 fn encode_control(id: u8, value: u8) -> Vec<u8> {
     encode_control_data(id, &[value])
+}
+
+/// Claim (`true`) or give up (`false`) the accessory's audio connection.
+pub fn encode_owns_connection(owns: bool) -> Vec<u8> {
+    encode_control(op::CTL_OWNS_CONNECTION, u8::from(owns))
+}
+
+// ---------------------------------------------------------------------------
+// Smart routing (opcode 0x0010). Bodies are OPACK dictionaries preceded by a
+// constant 0x01. Key names and values follow LibrePods' AACPManager.kt; the
+// Hijackv2 body is checked against the iPhone capture quoted in its history.
+// ---------------------------------------------------------------------------
+
+/// `PlayingApp` value LibrePods sends when no app is known.
+pub const PLAYING_APP_UNKNOWN: &str = "NA";
+/// `btName` announced to other hosts unless configured (LibrePods PR #202).
+pub const DEFAULT_BT_NAME: &str = "Mac";
+/// Longest string that fits the one-byte OPACK tag `0x40 + length`.
+pub const OPACK_SHORT_STRING: usize = 32;
+/// Key whose presence in a relayed 0x0011 body asks this host to yield.
+const OWNERSHIP_TO_FALSE: &[u8] = b"audioRoutingSetOwnershipToFalse";
+const OPACK_TRUE: u8 = 0x01;
+
+fn opack_str(out: &mut Vec<u8>, s: &str) {
+    let mut end = s.len().min(OPACK_SHORT_STRING);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    // end <= 32, so the tag stays inside 0x40..=0x60.
+    out.push(0x40 + end as u8);
+    out.extend_from_slice(&s.as_bytes()[..end]);
+}
+
+fn opack_uint(out: &mut Vec<u8>, v: u16) {
+    match v {
+        0..=39 => out.push(0x08 + v as u8),
+        40..=127 => out.extend_from_slice(&[0x30, v as u8]),
+        _ => {
+            out.push(0x31);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Start a body holding an OPACK dictionary of `entries` pairs.
+fn opack_body(entries: u8) -> Vec<u8> {
+    vec![0x01, 0xE0 + entries]
+}
+
+/// Frame an OPACK body as a 0x0010 message the accessory relays to `target`.
+pub fn encode_smart_routing(target: Address, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(op::HEADER_LEN + 8 + body.len());
+    v.extend_from_slice(&op::PREFIX);
+    v.extend_from_slice(&op::OP_SMART_ROUTING.to_le_bytes());
+    let mut mac = target.0;
+    mac.reverse();
+    v.extend_from_slice(&mac);
+    let len = u16::try_from(body.len()).unwrap_or(u16::MAX);
+    v.extend_from_slice(&len.to_le_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// Ask `target` to give up the audio route (`reason = Hijackv2`).
+pub fn encode_hijack_v2(target: Address) -> Vec<u8> {
+    let mut b = opack_body(5);
+    opack_str(&mut b, "localscore");
+    opack_uint(&mut b, 100);
+    opack_str(&mut b, "reason");
+    opack_str(&mut b, "Hijackv2");
+    opack_str(&mut b, "audioRoutingScore");
+    opack_uint(&mut b, 301);
+    opack_str(&mut b, "audioRoutingSetOwnershipToFalse");
+    b.push(OPACK_TRUE);
+    opack_str(&mut b, "remotescore");
+    // Back-reference to the sixth object, the score 301.
+    b.push(0xA5);
+    encode_smart_routing(target, &b)
+}
+
+/// Tell `target` what this host is playing and whether it is streaming.
+pub fn encode_media_info(
+    target: Address,
+    local: Address,
+    playing_app: &str,
+    streaming: bool,
+    bt_name: &str,
+) -> Vec<u8> {
+    let mut b = opack_body(5);
+    opack_str(&mut b, "PlayingApp");
+    opack_str(&mut b, playing_app);
+    opack_str(&mut b, "HostStreamingState");
+    opack_str(&mut b, if streaming { "YES" } else { "NO" });
+    opack_str(&mut b, "btAddress");
+    opack_str(&mut b, &local.to_string());
+    opack_str(&mut b, "btName");
+    opack_str(&mut b, bt_name);
+    opack_str(&mut b, "otherDeviceAudioCategory");
+    opack_uint(&mut b, 301);
+    encode_smart_routing(target, &b)
+}
+
+/// Media information for a host that just joined (idle, not streaming).
+pub fn encode_media_info_new_device(target: Address, local: Address, bt_name: &str) -> Vec<u8> {
+    let mut b = opack_body(5);
+    opack_str(&mut b, "playingApp");
+    opack_str(&mut b, PLAYING_APP_UNKNOWN);
+    opack_str(&mut b, "hostStreamingState");
+    opack_str(&mut b, "NO");
+    opack_str(&mut b, "btAddress");
+    opack_str(&mut b, &local.to_string());
+    opack_str(&mut b, "btName");
+    opack_str(&mut b, bt_name);
+    opack_str(&mut b, "otherDeviceAudioCategory");
+    opack_uint(&mut b, 100);
+    encode_smart_routing(target, &b)
+}
+
+/// Introduce this host to a host that just joined (`newTipi`).
+pub fn encode_new_tipi(target: Address, local: Address, bt_name: &str) -> Vec<u8> {
+    let mut b = opack_body(5);
+    opack_str(&mut b, "idleTime");
+    opack_uint(&mut b, 0);
+    opack_str(&mut b, "newTipi");
+    b.push(OPACK_TRUE);
+    opack_str(&mut b, "btAddress");
+    opack_str(&mut b, &local.to_string());
+    opack_str(&mut b, "btName");
+    opack_str(&mut b, bt_name);
+    opack_str(&mut b, "nearbyAudioScore");
+    opack_uint(&mut b, 6);
+    encode_smart_routing(target, &b)
+}
+
+/// Whether a relayed smart-routing body asks this host to give up ownership.
+/// A substring match, as LibrePods does; the OPACK body is not parsed.
+pub fn smart_routing_requests_yield(body: &[u8]) -> bool {
+    body.windows(OWNERSHIP_TO_FALSE.len())
+        .any(|w| w == OWNERSHIP_TO_FALSE)
 }
 
 /// Set the noise control mode.
@@ -903,5 +1199,344 @@ mod tests {
             Packet::Control(ControlState::Setting(setting.clone()))
         );
         assert!(encode_set_setting(&setting).is_err());
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    const HOST: &str = "5C:F3:70:0D:0E:0F";
+    const AIRPODS: &str = "BC:80:4E:01:02:03";
+
+    fn addr(s: &str) -> Address {
+        s.parse().unwrap()
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Frame a payload captured from the user's AirPods (hex after the header).
+    fn frame(opcode: u8, payload: &str) -> Vec<u8> {
+        let mut v = vec![0x04, 0x00, 0x04, 0x00, opcode, 0x00];
+        v.extend(hex(payload));
+        v
+    }
+
+    fn cat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn real_address_reports_decode_with_reversed_addresses() {
+        assert_eq!(
+            decode(&frame(0x0c, "03 02 01 4e 80 bc 00 02")).unwrap(),
+            Packet::AddressReport {
+                address: addr(AIRPODS),
+                extra: [0x00, 0x02]
+            }
+        );
+        assert_eq!(
+            decode(&frame(0x0c, "0f 0e 0d 70 f3 5c 01 01")).unwrap(),
+            Packet::AddressReport {
+                address: addr(HOST),
+                extra: [0x01, 0x01]
+            }
+        );
+        assert_eq!(
+            decode(&frame(0x0c, "0f 0e 0d 70 f3 5c 01")),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn real_audio_source_reports_decode() {
+        assert_eq!(
+            decode(&frame(0x0e, "0f 0e 0d 70 f3 5c 00")).unwrap(),
+            Packet::AudioSource {
+                address: addr(HOST),
+                state: AudioSourceState::Idle
+            }
+        );
+        assert_eq!(
+            decode(&frame(0x0e, "0f 0e 0d 70 f3 5c 02")).unwrap(),
+            Packet::AudioSource {
+                address: addr(HOST),
+                state: AudioSourceState::Media
+            }
+        );
+        assert!(matches!(
+            decode(&frame(0x0e, "0f 0e 0d 70 f3 5c 01")).unwrap(),
+            Packet::AudioSource {
+                state: AudioSourceState::Call,
+                ..
+            }
+        ));
+        assert_eq!(
+            decode(&frame(0x0e, "0f 0e 0d 70 f3 5c")),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn real_connected_devices_reports_decode_in_wire_order() {
+        for (payload, header) in [
+            ("01 00 01 5c f3 70 0d 0e 0f 02 02", [0x01, 0x00]),
+            ("01 02 01 5c f3 70 0d 0e 0f 02 02", [0x01, 0x02]),
+        ] {
+            assert_eq!(
+                decode(&frame(0x2e, payload)).unwrap(),
+                Packet::ConnectedDevices {
+                    header,
+                    devices: vec![ConnectedDevice {
+                        address: addr(HOST),
+                        info: [0x02, 0x02]
+                    }]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_host_reads_identically_from_reversed_and_forward_layouts() {
+        let Packet::AudioSource { address: a, .. } =
+            decode(&frame(0x0e, "0f 0e 0d 70 f3 5c 02")).unwrap()
+        else {
+            panic!("not an audio source");
+        };
+        let Packet::ConnectedDevices { devices, .. } =
+            decode(&frame(0x2e, "01 00 01 5c f3 70 0d 0e 0f 02 02")).unwrap()
+        else {
+            panic!("not a device list");
+        };
+        assert_eq!(a, devices[0].address);
+        assert_eq!(a.to_string(), HOST);
+    }
+
+    #[test]
+    fn info_byte_0_reads_the_listed_host_link_state() {
+        // Reports with the Mac FC:B2:14:0A:0B:0C first, this host second,
+        // each lined up against the Mac's own connection log.
+        for (payload, mac_up, host_up) in [
+            // Shortly after the Mac logs Conn Disconnected.
+            (
+                "01 01 02 fc b2 14 0a 0b 0c 00 15 5c f3 70 0d 0e 0f 02 03",
+                false,
+                true,
+            ),
+            // The Mac connecting again.
+            (
+                "01 01 02 fc b2 14 0a 0b 0c 01 05 5c f3 70 0d 0e 0f 02 03",
+                false,
+                true,
+            ),
+            // Just before the Mac logs Conn Connected.
+            (
+                "01 00 02 fc b2 14 0a 0b 0c 02 17 5c f3 70 0d 0e 0f 01 01",
+                true,
+                false,
+            ),
+            // Both links up, the state right before a drop.
+            (
+                "01 02 02 fc b2 14 0a 0b 0c 02 15 5c f3 70 0d 0e 0f 02 03",
+                true,
+                true,
+            ),
+        ] {
+            let Packet::ConnectedDevices { devices, .. } = decode(&frame(0x2e, payload)).unwrap()
+            else {
+                panic!("not a device list");
+            };
+            assert_eq!(devices[0].is_link_up(), mac_up, "{payload}");
+            assert_eq!(devices[1].is_link_up(), host_up, "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_short_device_list_keeps_the_complete_entries() {
+        let pkt = decode(&frame(0x2e, "01 00 02 5c f3 70 0d 0e 0f 02 02 aa bb")).unwrap();
+        let Packet::ConnectedDevices { devices, .. } = pkt else {
+            panic!("not a device list");
+        };
+        assert_eq!(devices.len(), 1);
+        assert_eq!(decode(&frame(0x2e, "01 00")), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn ownership_control_matches_librepods_both_ways() {
+        // docs/control_commands.md: 0x06 owns connection, 01 own, 00 not.
+        let own = hex("04 00 04 00 09 00 06 01 00 00 00");
+        let not = hex("04 00 04 00 09 00 06 00 00 00 00");
+        assert_eq!(encode_owns_connection(true), own);
+        assert_eq!(encode_owns_connection(false), not);
+        assert_eq!(
+            decode(&own).unwrap(),
+            Packet::Control(ControlState::OwnsConnection(true))
+        );
+        assert_eq!(
+            decode(&not).unwrap(),
+            Packet::Control(ControlState::OwnsConnection(false))
+        );
+    }
+
+    #[test]
+    fn hijack_matches_the_capture_in_librepods_history() {
+        let target = addr("AA:BB:CC:DD:EE:FF");
+        let captured = hex(
+            "620001E54A6C6F63616C73636F7265306446726561736F6E4848696A61636B763251617564696F\
+             526F7574696E6753636F7265312D015F617564696F526F7574696E675365744F776E6572736869\
+             70546F46616C7365014B72656D6F746573636F7265A5",
+        );
+        let expected = cat(&[
+            &[0x04, 0x00, 0x04, 0x00, 0x10, 0x00],
+            &[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA],
+            &captured,
+        ]);
+        assert_eq!(encode_hijack_v2(target), expected);
+        assert_eq!(expected.len(), 6 + 106, "LibrePods allocates 106 bytes");
+    }
+
+    #[test]
+    fn new_tipi_matches_librepods_create_add_tipi_device_packet() {
+        let target = addr("AA:BB:CC:DD:EE:FF");
+        let local = addr(HOST);
+        let expected = cat(&[
+            &[0x04, 0x00, 0x04, 0x00, 0x10, 0x00],
+            &[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA],
+            &[0x52, 0x00],
+            &[0x01, 0xE5],
+            &[0x48],
+            b"idleTime",
+            &[0x08, 0x47],
+            b"newTipi",
+            &[0x01, 0x49],
+            b"btAddress",
+            &[0x51],
+            HOST.as_bytes(),
+            &[0x46],
+            b"btName",
+            &[0x47],
+            b"Android",
+            &[0x50],
+            b"nearbyAudioScore",
+            &[0x0E],
+        ]);
+        assert_eq!(encode_new_tipi(target, local, "Android"), expected);
+        assert_eq!(expected.len(), 6 + 90);
+    }
+
+    #[test]
+    fn new_device_media_info_matches_librepods() {
+        let target = addr("AA:BB:CC:DD:EE:FF");
+        let expected = cat(&[
+            &[0x04, 0x00, 0x04, 0x00, 0x10, 0x00],
+            &[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA],
+            &[0x6C, 0x00],
+            &[0x01, 0xE5, 0x4A],
+            b"playingApp",
+            &[0x42],
+            b"NA",
+            &[0x52],
+            b"hostStreamingState",
+            &[0x42],
+            b"NO",
+            &[0x49],
+            b"btAddress",
+            &[0x51],
+            HOST.as_bytes(),
+            &[0x46],
+            b"btName",
+            &[0x47],
+            b"Android",
+            &[0x58],
+            b"otherDevice",
+            b"AudioCategory",
+            &[0x30, 0x64],
+        ]);
+        assert_eq!(
+            encode_media_info_new_device(target, addr(HOST), "Android"),
+            expected
+        );
+        assert_eq!(expected.len(), 6 + 116);
+    }
+
+    /// LibrePods' createMediaInformationPacket, with its two OPACK slips
+    /// corrected: the `btName` key lacks its 0x46 tag and "YES" is tagged as a
+    /// two-byte string (0x42). It also zero-pads to a fixed buffer; auris sends
+    /// the exact body length instead.
+    #[test]
+    fn streaming_media_info_matches_librepods_with_opack_tags_corrected() {
+        let target = addr("AA:BB:CC:DD:EE:FF");
+        let body = cat(&[
+            &[0x01, 0xE5, 0x4A],
+            b"PlayingApp",
+            &[0x56],
+            b"com.google.ios.youtube",
+            &[0x52],
+            b"HostStreamingState",
+            &[0x43],
+            b"YES",
+            &[0x49],
+            b"btAddress",
+            &[0x51],
+            HOST.as_bytes(),
+            &[0x46],
+            b"btName",
+            &[0x43],
+            b"Mac",
+            &[0x58],
+            b"otherDevice",
+            b"AudioCategory",
+            &[0x31, 0x2D, 0x01],
+        ]);
+        let expected = cat(&[
+            &[0x04, 0x00, 0x04, 0x00, 0x10, 0x00],
+            &[0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA],
+            &(body.len() as u16).to_le_bytes(),
+            &body,
+        ]);
+        assert_eq!(
+            encode_media_info(
+                target,
+                addr(HOST),
+                "com.google.ios.youtube",
+                true,
+                DEFAULT_BT_NAME
+            ),
+            expected
+        );
+        let stopped = encode_media_info(target, addr(HOST), "NA", false, "Mac");
+        assert!(stopped.windows(3).any(|w| w == [0x42, b'N', b'O']));
+    }
+
+    #[test]
+    fn long_strings_are_cut_at_a_character_boundary() {
+        let mut out = Vec::new();
+        opack_str(&mut out, &"é".repeat(20));
+        assert_eq!(out[0], 0x40 + 32);
+        assert_eq!(out.len(), 33);
+        assert!(std::str::from_utf8(&out[1..]).is_ok());
+    }
+
+    #[test]
+    fn relayed_ownership_request_decodes_with_its_sender() {
+        let mut relayed = encode_hijack_v2(addr(HOST));
+        relayed[4] = 0x11;
+        // The relay carries the sender where the request carried the target.
+        relayed[6..12].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        let Packet::SmartRouting { sender, body } = decode(&relayed).unwrap() else {
+            panic!("not smart routing");
+        };
+        assert_eq!(sender, addr("06:05:04:03:02:01"));
+        assert!(smart_routing_requests_yield(&body));
+        assert!(!smart_routing_requests_yield(
+            b"\x01\xe1\x46reason\x48Hijackv2"
+        ));
+        assert_eq!(decode(&relayed[..13]), Err(DecodeError::Truncated));
     }
 }

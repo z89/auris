@@ -11,13 +11,19 @@
 //! audio; local Bluetooth state cannot prove ownership by another host.
 
 pub mod aap;
+pub mod audio_route;
+pub mod autoconnect;
 pub mod ble;
 pub mod bluez;
 pub mod cache;
 pub mod config;
 pub mod ctl_proto;
 pub mod ctl_server;
+pub mod ear_media;
+pub mod handoff;
 pub mod models;
+pub mod mpris;
+pub mod rejoin;
 pub mod settings;
 pub mod state;
 pub mod store;
@@ -26,6 +32,12 @@ pub mod writer;
 /// Current time as RFC3339 with the local UTC offset, second resolution.
 pub fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+/// The same instant in UTC, with a `Z` suffix and no sub-second digits.
+/// `link.since` uses this so a reader never has to reconcile two offsets.
+pub fn now_rfc3339_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 #[cfg(test)]

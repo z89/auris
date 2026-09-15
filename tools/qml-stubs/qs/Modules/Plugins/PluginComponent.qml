@@ -33,6 +33,14 @@ Item {
     function setVisibilityOverride(value) {
         visibilityOverride = value;
     }
+    // The real component forwards this to its popout's close(). The stub
+    // records it instead, so a test can tell an automatic close from a
+    // panel that simply stopped being asked for.
+    property int closePopoutCount: 0
+    signal popoutCloseRequested
+
     function closePopout() {
+        closePopoutCount += 1;
+        popoutCloseRequested();
     }
 }

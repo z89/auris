@@ -13,6 +13,9 @@ Environment=RUST_LOG=aurisd=info
 RuntimeDirectory=aurisd
 RuntimeDirectoryMode=0700
 CacheDirectory=aurisd
+# `set_handoff` persists to $XDG_CONFIG_HOME/aurisd/config.toml; this is
+# the one home path the sandbox lets the daemon write.
+ConfigurationDirectory=aurisd
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only

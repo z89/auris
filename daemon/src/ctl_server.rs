@@ -342,7 +342,7 @@ mod tests {
 
         let first: serde_json::Value =
             serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(first["schema"], 1, "first line must be the snapshot");
+        assert_eq!(first["schema"], 2, "first line must be the snapshot");
         assert_eq!(first["device"]["connected"], false);
 
         store.apply(Update::AclConnected(true));
@@ -374,7 +374,7 @@ mod tests {
             write.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
             let v: serde_json::Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(v["schema"], 1);
+            assert_eq!(v["schema"], 2);
         }
 
         unbind(&path);
