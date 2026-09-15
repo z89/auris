@@ -8,6 +8,7 @@ Window {
 
     property int settingRequests: 0
     property int renameRequests: 0
+    property int handoffRequests: 0
     property bool failed: false
     property bool loaderAvailable: false
     property int loaderRequests: 0
@@ -92,6 +93,7 @@ Window {
             personalizedVolume: null
             onRenameRequested: testWindow.renameRequests++
             onSettingRequested: testWindow.settingRequests++
+            onHandoffToggleRequested: testWindow.handoffRequests++
         }
     }
 
@@ -117,9 +119,11 @@ Window {
             for (const label of ["Device name", "Microphone", "Press speed", "Hold duration", "Listening-mode cycle", "Call controls", "Personalized Volume"])
                 testWindow.check(testWindow.containsLabel(panel, label), "missing inline control: " + label);
             const settingsSurface = testWindow.findNamed(panel, "advancedSettingsSurface");
-            testWindow.check(settingsSurface !== null && settingsSurface.height <= 660, "wrapped compact settings surface grew beyond 660 px: " + (settingsSurface ? settingsSurface.height : "missing"));
+            // Every setting now reserves a caption lane for the daemon's own
+            // verification verdict, which a control may never be without.
+            testWindow.check(settingsSurface !== null && settingsSurface.height <= 760, "wrapped compact settings surface grew beyond 760 px: " + (settingsSurface ? settingsSurface.height : "missing"));
             const helpQualifications = {
-                "rename": "report it back",
+                "rename": "Apple devices keep their own name",
                 "microphone": "Bluetooth microphone codec",
                 "press_speed": "does not change what a press does",
                 "hold_duration": "does not change the action",
@@ -186,7 +190,7 @@ Window {
             panel.microphone = "auto";
             const requestedMic = testWindow.findNamed(panel, "settingChoice_microphone_2");
             const confirmedMic = testWindow.findNamed(panel, "settingChoice_microphone_0");
-            testWindow.check(microphoneRow.requestText === "Pending" && testWindow.containsLabel(microphoneRow, "Pending"), "pending microphone request has no fixed-lane indicator");
+            testWindow.check(microphoneRow.requestText === "Waiting\u2026" && testWindow.containsLabel(microphoneRow, "Waiting\u2026"), "pending microphone request has no fixed-lane indicator");
             testWindow.check(panel.implicitHeight === stableSettingsHeight && settingsSurface.height === stableSurfaceHeight, "pending status changed settings geometry");
             testWindow.check(requestedMic !== null && requestedMic.selected && requestedMic.requestedSelected && !requestedMic.confirmedSelected, "requested target was not selected independently from the confirmed value");
             testWindow.check(confirmedMic !== null && confirmedMic.confirmedSelected && !confirmedMic.selected, "confirmed value was overwritten instead of retained separately");
@@ -222,6 +226,32 @@ Window {
             testWindow.check(JSON.stringify(panel.cycleDraft) === '["off","anc","transparency"]', "external report overwrote a deliberate draft");
             panel.deviceIdentity = "AA:BB:CC:DD:EE:FF";
             testWindow.check(JSON.stringify(panel.cycleDraft) === '["transparency","adaptive"]', "device change retained another device's draft");
+            // Seamless switching is inert until the daemon publishes `handoff`.
+            const handoffToggle = testWindow.findNamed(panel, "aurisHandoffToggle");
+            const appleIdCaption = testWindow.findNamed(panel, "aurisHandoffAppleIdCaption");
+            testWindow.check(handoffToggle !== null && appleIdCaption !== null, "seamless switching controls missing");
+            if (handoffToggle && appleIdCaption) {
+                testWindow.check(!handoffToggle.enabled && !appleIdCaption.visible, "seamless switching usable without a handoff object");
+                testWindow.check(!panel.submitHandoff(true) && testWindow.handoffRequests === 0, "handoff request sent without a handoff object");
+                panel.handoff = {
+                    "enabled": false,
+                    "take_over_on_play": true,
+                    "apple_host_id": false,
+                    "owner": "unknown",
+                    "audio_source": null,
+                    "devices": [],
+                    "last_event": null
+                };
+                testWindow.check(handoffToggle.enabled && !handoffToggle.checked && appleIdCaption.visible, "handoff disabled state or Apple ID caption wrong");
+                handoffToggle.toggled(true);
+                testWindow.check(testWindow.handoffRequests === 1, "handoff toggle request not emitted");
+                panel.handoff = Object.assign({}, panel.handoff, {
+                    "enabled": true,
+                    "apple_host_id": true
+                });
+                testWindow.check(handoffToggle.checked && !appleIdCaption.visible, "handoff enabled state or Apple ID caption wrong");
+                panel.handoff = null;
+            }
             if (testWindow.failed) {
                 Qt.exit(1);
                 return;

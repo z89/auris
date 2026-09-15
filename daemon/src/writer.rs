@@ -106,7 +106,7 @@ mod tests {
         write_atomic(&path, &Snapshot::example()).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert!(
             !dir.join(".state.json.tmp").exists(),
             "temp file must be renamed away"

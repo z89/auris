@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="1534" viewBox="0 0 980 1534" font-family="Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8fd3ff"/></marker>
+  </defs>
+  <rect width="980" height="1534" rx="20" fill="#1b1a20"/>
+  <rect x="40" y="40" width="500" height="332" rx="16" fill="#232229" stroke="#8fd3ff" stroke-width="1"/>
+  <text x="66" y="78" font-size="17" fill="#efedf4" font-weight="600">AirPods 4 (ANC)</text>
+  <line x1="66" y1="98" x2="514" y2="98" stroke="#35343e" stroke-width="1"/>
+  <text x="66" y="124" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.5">audio</text>
+  <text x="66" y="143" font-size="12.5" fill="#efedf4">A2DP and HFP profiles</text>
+  <text x="66" y="179" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.5">control</text>
+  <text x="66" y="198" font-size="12.5" fill="#efedf4">AAP over L2CAP, PSM 0x1001</text>
+  <text x="66" y="234" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.5">reports</text>
+  <text x="66" y="253" font-size="12.5" fill="#efedf4">battery per bud and case, in-ear state,</text>
+  <text x="66" y="272" font-size="12.5" fill="#efedf4">noise-control mode, device metadata</text>
+  <text x="66" y="308" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.5">relays</text>
+  <text x="66" y="327" font-size="12.5" fill="#efedf4">multi-host ownership and smart-routing</text>
+  <text x="66" y="346" font-size="12.5" fill="#efedf4">messages between the hosts</text>
+  <rect x="700" y="124.5" width="240" height="163" rx="16" fill="#232229" stroke="#35343e" stroke-width="1"/>
+  <text x="726" y="162.5" font-size="15" fill="#efedf4" font-weight="600">Other Apple hosts</text>
+  <line x1="726" y1="182.5" x2="914" y2="182.5" stroke="#35343e" stroke-width="1"/>
+  <text x="726" y="206.5" font-size="12.5" fill="#efedf4">Mac, iPhone and iPad</text>
+  <text x="726" y="225.5" font-size="12.5" fill="#8a8794">share the same AirPods.</text>
+  <text x="726" y="244.5" font-size="12.5" fill="#8a8794">They claim and release</text>
+  <text x="726" y="263.5" font-size="12.5" fill="#8a8794">ownership in turn.</text>
+  <line x1="546" y1="206" x2="694" y2="206" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="571.415" y="178" width="97.17" height="56" rx="7" fill="#1b1a20"/>
+  <text x="620" y="195.5" font-size="10.5" fill="#8a8794" text-anchor="middle">AAP relay</text>
+  <text x="620" y="209.5" font-size="10.5" fill="#8a8794" text-anchor="middle">ownership +</text>
+  <text x="620" y="223.5" font-size="10.5" fill="#8a8794" text-anchor="middle">smart routing</text>
+  <text x="40" y="424" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">LINUX HOST</text>
+  <rect x="40" y="450" width="340" height="106" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="66" y="486" font-size="15" fill="#efedf4" font-weight="600">BlueZ</text>
+  <text x="66" y="512" font-size="12" fill="#8a8794">pairing, connection and link</text>
+  <text x="66" y="531" font-size="12" fill="#8a8794">events over D-Bus</text>
+  <rect x="600" y="450" width="340" height="106" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="626" y="486" font-size="15" fill="#efedf4" font-weight="600">PipeWire</text>
+  <text x="626" y="512" font-size="12" fill="#8a8794">A2DP sink; the card profile</text>
+  <text x="626" y="531" font-size="12" fill="#8a8794">follows ownership</text>
+  <line x1="210" y1="378" x2="210" y2="444" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="158.37" y="397" width="103.26" height="28" rx="7" fill="#1b1a20"/>
+  <text x="210" y="414.5" font-size="10.5" fill="#8a8794" text-anchor="middle">Bluetooth link</text>
+  <path d="M546,330 L770,330 L770,444" fill="none" stroke="#8fd3ff" stroke-width="1" stroke-linejoin="round" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="615.55" y="316" width="78.9" height="28" rx="7" fill="#1b1a20"/>
+  <text x="655" y="333.5" font-size="10.5" fill="#8a8794" text-anchor="middle">A2DP / HFP</text>
+  <line x1="490" y1="378" x2="490" y2="628" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="438.37" y="482" width="103.26" height="42" rx="7" fill="#1b1a20"/>
+  <text x="490" y="499.5" font-size="10.5" fill="#8a8794" text-anchor="middle">AAP over L2CAP</text>
+  <text x="490" y="513.5" font-size="10.5" fill="#8a8794" text-anchor="middle">PSM 0x1001</text>
+  <line x1="210" y1="562" x2="210" y2="628" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="185.775" y="581" width="48.45" height="28" rx="7" fill="#1b1a20"/>
+  <text x="210" y="598.5" font-size="10.5" fill="#8a8794" text-anchor="middle">D-Bus</text>
+  <line x1="770" y1="562" x2="770" y2="628" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="724.46" y="581" width="91.08" height="28" rx="7" fill="#1b1a20"/>
+  <text x="770" y="598.5" font-size="10.5" fill="#8a8794" text-anchor="middle">card profile</text>
+  <rect x="40" y="634" width="900" height="594" rx="16" fill="#232229" stroke="#8fd3ff" stroke-width="1"/>
+  <text x="66" y="672" font-size="17" fill="#efedf4" font-weight="600">aurisd</text>
+  <text x="142.343" y="672" font-size="11.5" fill="#8a8794">Rust, user service, no root</text>
+  <line x1="66" y1="692" x2="914" y2="692" stroke="#35343e" stroke-width="1"/>
+  <rect x="66" y="722" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="86" y="754" font-size="13" fill="#8fd3ff" font-weight="600">aap session</text>
+  <text x="86" y="778" font-size="11.5" fill="#8a8794">handshake, notification subscription,</text>
+  <text x="86" y="796" font-size="11.5" fill="#8a8794">battery / ear / metadata / control echoes</text>
+  <rect x="510" y="722" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="530" y="754" font-size="13" fill="#8fd3ff" font-weight="600">handoff</text>
+  <text x="530" y="778" font-size="11.5" fill="#8a8794">MPRIS playback edges plus AAP ownership</text>
+  <text x="530" y="796" font-size="11.5" fill="#8a8794">messages; decides yield and take-over</text>
+  <rect x="66" y="856" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="86" y="888" font-size="13" fill="#8fd3ff" font-weight="600">autoconnect</text>
+  <text x="86" y="912" font-size="11.5" fill="#8a8794">BLE proximity advertisement on case open,</text>
+  <text x="86" y="930" font-size="11.5" fill="#8a8794">asks BlueZ to connect</text>
+  <rect x="510" y="856" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="530" y="888" font-size="13" fill="#8fd3ff" font-weight="600">rejoin</text>
+  <text x="530" y="912" font-size="11.5" fill="#8a8794">classifies link loss; one guarded reconnect</text>
+  <text x="530" y="930" font-size="11.5" fill="#8a8794">after an eviction or a bud role swap</text>
+  <rect x="66" y="990" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="86" y="1022" font-size="13" fill="#8fd3ff" font-weight="600">settings</text>
+  <text x="86" y="1046" font-size="11.5" fill="#8a8794">writes a control, waits for the accessory's</text>
+  <text x="86" y="1064" font-size="11.5" fill="#8a8794">report, marks confirmed or mismatched</text>
+  <rect x="510" y="990" width="404" height="94" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="530" y="1022" font-size="13" fill="#8fd3ff" font-weight="600">ear media</text>
+  <text x="530" y="1046" font-size="11.5" fill="#8a8794">in-ear transitions pause and resume</text>
+  <text x="530" y="1064" font-size="11.5" fill="#8a8794">local players</text>
+  <rect x="66" y="1124" width="848" height="76" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="86" y="1156" font-size="13" fill="#8fd3ff" font-weight="600">store</text>
+  <text x="86" y="1180" font-size="11.5" fill="#8a8794">folds updates into one snapshot, writes state.json, pushes to socket subscribers</text>
+  <rect x="40" y="1306" width="420" height="106" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="66" y="1342" font-size="15" fill="#efedf4" font-weight="600">Clients</text>
+  <text x="66" y="1368" font-size="12" fill="#8a8794">auris CLI and the DankMaterialShell plugin,</text>
+  <text x="66" y="1387" font-size="12" fill="#8a8794">both over the same unix control socket.</text>
+  <rect x="520" y="1306" width="420" height="106" rx="12" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <text x="546" y="1342" font-size="15" fill="#efedf4" font-weight="600">Media players</text>
+  <text x="546" y="1368" font-size="12" fill="#8a8794">local MPRIS players that aurisd pauses</text>
+  <text x="546" y="1387" font-size="12" fill="#8a8794">and resumes on ear and ownership edges.</text>
+  <line x1="250" y1="1234" x2="250" y2="1300" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="207.505" y="1246" width="84.99" height="42" rx="7" fill="#1b1a20"/>
+  <text x="250" y="1263.5" font-size="10.5" fill="#8a8794" text-anchor="middle">unix socket</text>
+  <text x="250" y="1277.5" font-size="10.5" fill="#8a8794" text-anchor="middle">state.json</text>
+  <line x1="730" y1="1234" x2="730" y2="1300" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)" marker-start="url(#ar)"/>
+  <rect x="705.775" y="1253" width="48.45" height="28" rx="7" fill="#1b1a20"/>
+  <text x="730" y="1270.5" font-size="10.5" fill="#8a8794" text-anchor="middle">MPRIS</text>
+  <text x="490" y="1474" font-size="12" fill="#8a8794" text-anchor="middle">Ownership and smart-routing messages are relayed by the AirPods between hosts,</text>
+  <text x="490" y="1494" font-size="12" fill="#8a8794" text-anchor="middle">so auris and an Apple host never talk to each other directly.</text>
+</svg>

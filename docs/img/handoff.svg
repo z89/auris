@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="418" viewBox="0 0 1240 418" font-family="Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8fd3ff"/></marker>
+  </defs>
+  <rect width="1240" height="418" rx="20" fill="#1b1a20"/>
+  <text x="40" y="50" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">OWNERSHIP HANDOFF</text>
+  <line x1="184.73" y1="46" x2="1200" y2="46" stroke="#35343e" stroke-width="1"/>
+  <rect x="40" y="84" width="248" height="154" rx="16" fill="#232229" stroke="#8fd3ff" stroke-width="1"/>
+  <text x="64" y="114" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">STEP 1</text>
+  <text x="64" y="140" font-size="14.5" fill="#efedf4" font-weight="600">Another host claims</text>
+  <line x1="64" y1="156" x2="264" y2="156" stroke="#35343e" stroke-width="1"/>
+  <text x="64" y="182" font-size="12" fill="#8a8794">A Mac, iPhone or iPad</text>
+  <text x="64" y="201" font-size="12" fill="#8a8794">takes ownership of the</text>
+  <text x="64" y="220" font-size="12" fill="#8a8794">AirPods.</text>
+  <line x1="302" y1="161" x2="330" y2="161" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="344" y="84" width="248" height="154" rx="16" fill="#232229" stroke="#35343e" stroke-width="1"/>
+  <text x="368" y="114" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">STEP 2</text>
+  <text x="368" y="140" font-size="14.5" fill="#efedf4" font-weight="600">auris yields</text>
+  <line x1="368" y1="156" x2="568" y2="156" stroke="#35343e" stroke-width="1"/>
+  <text x="368" y="182" font-size="12" fill="#8a8794">aurisd pauses local</text>
+  <text x="368" y="201" font-size="12" fill="#8a8794">players and releases its</text>
+  <text x="368" y="220" font-size="12" fill="#8a8794">side of the transport.</text>
+  <line x1="606" y1="161" x2="634" y2="161" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="648" y="84" width="248" height="154" rx="16" fill="#232229" stroke="#35343e" stroke-width="1"/>
+  <text x="672" y="114" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">STEP 3</text>
+  <text x="672" y="140" font-size="14.5" fill="#efedf4" font-weight="600">AirPods relay it</text>
+  <line x1="672" y1="156" x2="872" y2="156" stroke="#35343e" stroke-width="1"/>
+  <text x="672" y="182" font-size="12" fill="#8a8794">The buds tell every host</text>
+  <text x="672" y="201" font-size="12" fill="#8a8794">who owns them now, and</text>
+  <text x="672" y="220" font-size="12" fill="#8a8794">auris records the change.</text>
+  <line x1="910" y1="161" x2="938" y2="161" stroke="#8fd3ff" stroke-width="1" marker-end="url(#ar)"/>
+  <rect x="952" y="84" width="248" height="154" rx="16" fill="#232229" stroke="#8fd3ff" stroke-width="1"/>
+  <text x="976" y="114" font-size="10.5" fill="#8fd3ff" font-weight="600" letter-spacing="1.7">STEP 4</text>
+  <text x="976" y="140" font-size="14.5" fill="#efedf4" font-weight="600">Play here to return</text>
+  <line x1="976" y1="156" x2="1176" y2="156" stroke="#35343e" stroke-width="1"/>
+  <text x="976" y="182" font-size="12" fill="#8a8794">Starting playback on this</text>
+  <text x="976" y="201" font-size="12" fill="#8a8794">host claims the AirPods</text>
+  <text x="976" y="220" font-size="12" fill="#8a8794">again.</text>
+  <rect x="40" y="300" width="552" height="78" rx="18" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <rect x="64" y="336" width="6" height="6" rx="3" fill="#8fd3ff"/>
+  <text x="86" y="333" font-size="12" fill="#8a8794">A reconnect after an eviction happens once;</text>
+  <text x="86" y="353" font-size="12" fill="#8a8794">a deliberate disconnect is never retried.</text>
+  <rect x="648" y="300" width="552" height="78" rx="18" fill="#26252e" stroke="#35343e" stroke-width="1"/>
+  <rect x="672" y="336" width="6" height="6" rx="3" fill="#8fd3ff"/>
+  <text x="694" y="333" font-size="12" fill="#8a8794">A player that resumes itself during the hold</text>
+  <text x="694" y="353" font-size="12" fill="#8a8794">is paused again so it cannot pull audio back.</text>
+</svg>

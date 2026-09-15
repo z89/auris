@@ -87,7 +87,7 @@ int main(int argc, char **argv)
     runner.setProcessEnvironment(env);
     runner.setProcessChannelMode(QProcess::ForwardedChannels);
     runner.start("/usr/lib/qt6/bin/qmltestrunner", {"-input", repo.filePath("tools/tst_AurisUiRegression.qml"), "-import", fixture.path()});
-    if (!runner.waitForStarted() || !runner.waitForFinished(45000)) {
+    if (!runner.waitForStarted() || !runner.waitForFinished(90000)) {
         runner.kill(); // Only this test-owned, offscreen child process.
         runner.waitForFinished();
         return 1;

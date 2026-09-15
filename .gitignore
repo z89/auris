@@ -2,3 +2,6 @@
 *.swp
 *~
 daemon/target/
+__pycache__/
+*.pyc
+.VSCodeCounter/

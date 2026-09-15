@@ -22,13 +22,29 @@ pub const OP_BATTERY: u16 = 0x0004;
 pub const OP_EAR_DETECTION: u16 = 0x0006;
 /// Control write, and the accessory's echo of the resulting state.
 pub const OP_CONTROL: u16 = 0x0009;
+/// Address report (accessory -> host): six address bytes, reversed, then two
+/// bytes whose meaning is not established. Named "MAC Address" by the
+/// apple-wireshark AACP dissector.
+pub const OP_ADDRESS_REPORT: u16 = 0x000C;
+/// Audio source (accessory -> host): six address bytes, reversed, then one
+/// status byte (00 idle, 01 call, 02 media).
+pub const OP_AUDIO_SOURCE: u16 = 0x000E;
 /// Subscribe to notifications (host -> accessory).
 pub const OP_REQUEST_NOTIFICATIONS: u16 = 0x000F;
+/// Smart routing (host -> accessory): target address reversed, u16 LE body
+/// length, OPACK body. The accessory relays it to the target host.
+pub const OP_SMART_ROUTING: u16 = 0x0010;
+/// Smart routing relayed from another host (accessory -> host): sender
+/// address reversed, u16 LE body length, OPACK body.
+pub const OP_SMART_ROUTING_RELAY: u16 = 0x0011;
 /// Rename the accessory (host -> accessory).
 pub const OP_RENAME: u16 = 0x001A;
 /// Device metadata: NUL-separated strings. The accessory pushes this
 /// unsolicited after the handshake; it cannot be requested.
 pub const OP_METADATA: u16 = 0x001D;
+/// Connected devices (accessory -> host): two unknown bytes, a count, then per
+/// host six address bytes in wire order (not reversed) and two info bytes.
+pub const OP_CONNECTED_DEVICES: u16 = 0x002E;
 /// Feature-negotiation acknowledgement (accessory -> host).
 pub const OP_FEATURES_ACK: u16 = 0x002B;
 /// Conversational-awareness speech event (accessory -> host). Sent while the
@@ -42,6 +58,9 @@ pub const OP_SET_FEATURES: u16 = 0x004D;
 // Control identifiers (byte 6 of an OP_CONTROL packet)
 // ---------------------------------------------------------------------------
 
+/// Connection ownership, both directions: 01 this host owns the audio
+/// connection, 00 it does not.
+pub const CTL_OWNS_CONNECTION: u8 = 0x06;
 /// Noise control: 01 off, 02 anc, 03 transparency, 04 adaptive.
 pub const CTL_NOISE_CONTROL: u8 = 0x0D;
 /// Conversational awareness: 01 on, 02 off.
@@ -76,6 +95,13 @@ pub const HANDSHAKE: [u8; 16] = [
 /// notifying.
 pub const SET_FEATURES_D7: [u8; 14] = [
     0x04, 0x00, 0x04, 0x00, 0x4d, 0x00, 0xd7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Set-features, full variant (14 bytes, `0xff`): what iOS sends. LibrePods
+/// documents that `0xd7` leaves some features locked. Forced with
+/// `AURISD_FEATURES=ff`.
+pub const SET_FEATURES_FF: [u8; 14] = [
+    0x04, 0x00, 0x04, 0x00, 0x4d, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// Set-features, alternate variant (14 bytes, `0x0e`), used by AlwxSin's Go

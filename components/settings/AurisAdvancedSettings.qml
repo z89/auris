@@ -16,9 +16,13 @@ Item {
 
     property bool available: false
     property string unavailableReason: ""
-    // Confirmed values above are intentionally never replaced by a request.
-    // This map only annotates the control that is waiting for a device report.
+    // Values above already carry whatever the widget wants shown, requested or
+    // reported. This map only annotates a control whose command is still with
+    // the CLI, or a rename the device has yet to echo.
     property var pendingRequests: ({})
+    // key -> {text, color}: what the daemon's own verification of that write
+    // found. Absent keys simply have nothing to say.
+    property var captions: ({})
     property string deviceIdentity: ""
     property string deviceName: ""
     property var microphone: null
@@ -27,8 +31,13 @@ Item {
     property var listeningModeCycle: null
     property var callControls: null
     property var personalizedVolume: null
+    // The daemon's `handoff` object, or null when this aurisd predates
+    // seamless switching (or is not running).
+    property var handoff: null
+    readonly property bool handoffKnown: handoff !== null && typeof handoff === "object"
 
     signal renameRequested(string name)
+    signal handoffToggleRequested(bool enabled)
     signal settingRequested(string key, var value)
 
     readonly property var cycleModes: ["off", "anc", "transparency", "adaptive"]
@@ -102,17 +111,28 @@ Item {
         return pendingRequests && pendingRequests[key] ? pendingRequests[key] : null;
     }
 
+    // Lifecycle only, and only while this component still owns the request.
+    // Whether a write actually landed is the daemon's to report, and it says so
+    // through captions; nothing here may imply a failure.
     function pendingText(key) {
         const pending = pendingFor(key);
         if (!pending)
             return "";
         if (pending.state === "sending")
             return "Sending…";
-        if (pending.state === "verifying")
-            return "Verifying…";
-        if (pending.state === "unconfirmed")
-            return "Unconfirmed";
-        return "Pending";
+        if (pending.state === "awaiting")
+            return "Waiting…";
+        return "Verifying…";
+    }
+
+    function captionFor(key) {
+        const entry = captions && captions[key] ? captions[key] : null;
+        return entry && typeof entry.text === "string" ? entry.text : "";
+    }
+
+    function captionColorFor(key) {
+        const entry = captions && captions[key] ? captions[key] : null;
+        return entry && entry.color !== undefined && entry.color !== null ? entry.color : Theme.surfaceVariantText;
     }
 
     function toggleCycleMode(mode) {
@@ -147,6 +167,13 @@ Item {
         if (!available || error.length > 0)
             return false;
         renameRequested(value);
+        return true;
+    }
+
+    function submitHandoff(enabled) {
+        if (!handoffKnown)
+            return false;
+        handoffToggleRequested(enabled);
         return true;
     }
 
@@ -295,7 +322,8 @@ Item {
             horizontalAlignment: Text.AlignRight
             elide: Text.ElideRight
             font.pixelSize: Theme.fontSizeSmall - 1
-            color: Theme.warning
+            // A lifecycle word is neutral; only "Not reported" is a caveat.
+            color: settingHeader.requestText.length > 0 ? Theme.surfaceVariantText : Theme.warning
         }
 
         InfoButton {
@@ -379,6 +407,33 @@ Item {
                     }
                 }
             }
+
+            SettingCaption {
+                settingKey: choiceRow.settingKey
+            }
+        }
+    }
+
+    // One line under a control, in its own permanently reserved lane: a caption
+    // arriving or leaving may never move the row below it.
+    component SettingCaption: StyledText {
+        required property string settingKey
+
+        objectName: "settingCaption_" + settingKey
+        width: parent ? parent.width : 0
+        height: Theme.fontSizeSmall + 4
+        verticalAlignment: Text.AlignVCenter
+        text: root.captionFor(settingKey)
+        opacity: text.length > 0 ? 1 : 0
+        elide: Text.ElideRight
+        font.pixelSize: Theme.fontSizeSmall
+        color: root.captionColorFor(settingKey)
+
+        Behavior on opacity {
+            NumberAnimation {
+                duration: Theme.shortDuration
+                easing.type: Theme.standardEasing
+            }
         }
     }
 
@@ -420,7 +475,7 @@ Item {
                         width: parent.width
                         settingKey: "rename"
                         title: "Device name"
-                        helpText: "Requests an accessory name change. The new name is shown only after the AirPods report it back."
+                        helpText: "Requests an accessory name change. The daemon reopens the AAP link and confirms the new name from the AirPods themselves. Apple devices keep their own name for this accessory and will not show it."
                         unknown: root.deviceName.length === 0
                         requestText: root.pendingText("rename")
                     }
@@ -451,6 +506,10 @@ Item {
                             enabled: root.available && root.renameValidationError(renameField.text).length === 0 && (renameField.text !== root.deviceName || root.pendingFor("rename") !== null)
                             onClicked: root.submitRename(renameField.text)
                         }
+                    }
+
+                    SettingCaption {
+                        settingKey: "rename"
                     }
 
                     StyledText {
@@ -557,10 +616,14 @@ Item {
                     StyledText {
                         width: parent.width
                         height: 16
-                        text: root.cycleNotice.length > 0 ? root.cycleNotice : root.cycleDraft.length < 2 ? "Select at least two modes to send" : "Requested changes send immediately; device report remains authoritative."
+                        text: root.cycleNotice.length > 0 ? root.cycleNotice : root.cycleDraft.length < 2 ? "Select at least two modes to send" : "Requested changes send immediately."
                         elide: Text.ElideRight
                         font.pixelSize: Theme.fontSizeSmall - 1
                         color: root.cycleNotice.length > 0 || root.cycleDraft.length < 2 ? Theme.warning : Theme.surfaceVariantText
+                    }
+
+                    SettingCaption {
+                        settingKey: "listening_mode_cycle"
                     }
                 }
 
@@ -588,6 +651,47 @@ Item {
                     confirmedValue: root.personalizedVolume
                     columns: 2
                     onChoiceRequested: value => root.submitSetting("personalized_volume", value)
+                }
+            }
+        }
+
+        // Host-side behaviour rather than an accessory setting, so it has its
+        // own surface and does not wait for the AAP settings link.
+        StyledRect {
+            objectName: "handoffSettingsSurface"
+            width: parent.width
+            height: handoffSettings.implicitHeight + Theme.spacingL * 2
+            radius: Theme.cornerRadius
+            color: Theme.floatingWindowNestedSurface
+            border.color: Theme.outlineMedium
+            border.width: Theme.layerOutlineWidth
+
+            Column {
+                id: handoffSettings
+
+                x: Theme.spacingL
+                y: Theme.spacingL
+                width: parent.width - Theme.spacingL * 2
+                spacing: Theme.spacingXS
+
+                DankToggle {
+                    objectName: "aurisHandoffToggle"
+                    width: parent.width
+                    text: "Seamless switching"
+                    description: "Hand the AirPods to your Mac or iPhone when they start playing, and take them back when you play here."
+                    checked: root.handoffKnown && root.handoff.enabled === true
+                    enabled: root.handoffKnown
+                    onToggled: isChecked => root.submitHandoff(isChecked)
+                }
+
+                StyledText {
+                    objectName: "aurisHandoffAppleIdCaption"
+                    width: parent.width
+                    visible: root.handoffKnown && root.handoff.apple_host_id === false
+                    text: "Needs the Apple Bluetooth ID. See the README."
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.warning
                 }
             }
         }

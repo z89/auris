@@ -5,9 +5,12 @@
 //! accessory that repeats the same battery packet every few seconds does not
 //! cause a file write.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use tokio::sync::watch;
@@ -17,7 +20,11 @@ use crate::{
     config::PrimaryBud,
     models,
     settings::{DeviceSettings, SettingCommand},
-    state::{Cell, EarState, NoiseControl, NoiseControlMode, Snapshot, Source},
+    state::{
+        Cell, EarState, Link, LinkReason, LinkStatus, NoiseControl, NoiseControlMode, Snapshot,
+        Source, NAME_KEY, STATUS_CONFIRMED, STATUS_MISMATCH, STATUS_UNREPORTED, STATUS_UNVERIFIED,
+        STATUS_VERIFYING, VERIFY_IDLE, VERIFY_REOPENING, VERIFY_SCHEDULED,
+    },
 };
 
 /// A fact learned about the accessory.
@@ -67,6 +74,62 @@ pub enum Update {
     AdaptiveLevel(u8),
     /// A typed setting confirmed by an accessory control-state echo.
     Setting(SettingCommand),
+    /// A setting datagram left the daemon. The accessory never echoes one, so
+    /// this only records what was asked for and arms the readback.
+    SettingRequested(SettingCommand),
+    /// A rename datagram left the daemon. Recorded under
+    /// [`crate::state::NAME_KEY`] so the readback judges it like a setting:
+    /// the accessory's own 0x1D metadata on the reopened link is the answer.
+    RenameRequested(String),
+    /// The AAP link is being dropped and reopened purely to read settings back.
+    VerifyReopening,
+    /// The readback window on the current link has closed: compare every
+    /// pending request against what this link reported.
+    VerifyCompleted,
+    /// The readback could not run, or did not finish inside its budget.
+    VerifyFailed,
+    /// Replace the published Apple multi-host switching view.
+    Handoff(crate::state::Handoff),
+    /// The reconnect sequence the session is running, or `None` when it is
+    /// running none. The published `link.status` also depends on
+    /// `device.connected`, which the store already holds, so the two can
+    /// arrive in either order.
+    Link(Option<LinkActivity>),
+}
+
+/// A reconnect sequence in flight, as the session sees it. Internal to the
+/// daemon: [`crate::state::Link`] is the published shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkActivity {
+    /// Why the sequence is running.
+    pub reason: LinkReason,
+    /// `Device1.Connect` calls started so far; `0` while only scheduled.
+    pub attempt: u32,
+    /// When the sequence started, RFC3339 in UTC.
+    pub since: String,
+}
+
+/// Bookkeeping the store needs but the published document must not carry.
+#[derive(Debug, Default)]
+struct Aux {
+    /// The last 0x0006 payload exactly as it came off the wire. Which bud the
+    /// primary byte describes depends on which buds are out of the case, and
+    /// that can arrive after the ear packet, so the resolution is redone on
+    /// every battery update from these raw bytes.
+    last_ear: Option<(EarState, EarState)>,
+    /// The reconnect sequence the session last reported, if any. The
+    /// published document carries the resolved `link` object instead, so a
+    /// later `AclConnected` can turn `reconnecting` into `connected` without
+    /// the session saying anything.
+    link: Option<LinkActivity>,
+    /// How often each setting key was reported since the current AAP link
+    /// opened. The lifetime counters in the snapshot cannot answer "did the
+    /// *fresh* link report this", which is the whole readback question.
+    link_reports: BTreeMap<String, u64>,
+    /// The name the accessory last gave in its own 0x1D metadata. It outranks
+    /// the BlueZ name, which BlueZ only re-reads when a link opens and which
+    /// can therefore be many minutes out of date after a rename.
+    metadata_name: Option<String>,
 }
 
 /// The selected identity and link generation at which a control command was
@@ -86,11 +149,8 @@ pub struct Store {
     /// Bumped whenever a command could otherwise cross a device or link
     /// boundary while waiting behind an opening sequence.
     connection_epoch: AtomicU64,
-    /// The last 0x0006 payload exactly as it came off the wire. Which bud the
-    /// primary byte describes depends on which buds are out of the case, and
-    /// that can arrive after the ear packet, so the resolution is redone on
-    /// every battery update from these raw bytes.
-    last_ear: Mutex<Option<(EarState, EarState)>>,
+    /// Non-published per-link bookkeeping.
+    aux: Mutex<Aux>,
 }
 
 impl Store {
@@ -100,7 +160,7 @@ impl Store {
             tx: watch::Sender::new(initial),
             primary_bud,
             connection_epoch: AtomicU64::new(0),
-            last_ear: Mutex::new(None),
+            aux: Mutex::new(Aux::default()),
         })
     }
 
@@ -128,8 +188,8 @@ impl Store {
 
     /// Apply an update, notifying watchers only if something actually changed.
     pub fn apply(&self, update: Update) {
-        let mut last_ear = self
-            .last_ear
+        let mut aux = self
+            .aux
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.tx.send_if_modified(|s| {
@@ -137,7 +197,7 @@ impl Store {
             // An unsuccessful tentative opening may never have set aap_link
             // true. Its teardown still invalidates commands queued behind it.
             let link_ended = matches!(&update, Update::AapLink(false));
-            mutate(s, update, self.primary_bud, &mut last_ear);
+            mutate(s, update, self.primary_bud, &mut aux);
             if link_ended
                 || s.device.address != before.device.address
                 || s.device.model_id != before.device.model_id
@@ -241,12 +301,108 @@ fn apply_setting(settings: &mut DeviceSettings, setting: SettingCommand) {
     }
 }
 
-fn mutate(
+/// Close the readback window: judge every request the current link could have
+/// answered. Only keys this link actually reported can be judged; a key the
+/// model never reports stays `unreported` until some later link reports it.
+fn finish_verification(
     s: &mut Snapshot,
-    update: Update,
-    primary_bud: PrimaryBud,
-    last_ear: &mut Option<(EarState, EarState)>,
+    link_reports: &BTreeMap<String, u64>,
+    metadata_name: Option<&str>,
 ) {
+    let mut reported = serde_json::to_value(&s.settings).unwrap_or(serde_json::Value::Null);
+    // The name is not part of `settings`; the accessory reports it in its own
+    // metadata packet. Fold it in so one loop judges every pending key.
+    if let (Some(object), Some(name)) = (reported.as_object_mut(), metadata_name) {
+        object.insert(
+            NAME_KEY.to_owned(),
+            serde_json::Value::String(name.to_owned()),
+        );
+    }
+    // Taken out to judge each key against `settings_requested` without holding
+    // two borrows of the snapshot; put back unconditionally below.
+    let mut statuses = std::mem::take(&mut s.settings_status);
+    for (key, status) in &mut statuses {
+        let pending = status == STATUS_VERIFYING;
+        // A key this model never reports, or one a dropped link could not
+        // answer, is still eligible: a later dump can settle it.
+        let recheck = status == STATUS_UNREPORTED || status == STATUS_UNVERIFIED;
+        if !pending && !recheck {
+            continue;
+        }
+        let Some(want) = s.settings_requested.get(key) else {
+            if pending {
+                *status = STATUS_UNVERIFIED.to_owned();
+            }
+            continue;
+        };
+        let fresh = link_reports
+            .contains_key(key)
+            .then(|| reported.get(key))
+            .flatten()
+            .filter(|value| !value.is_null());
+        match fresh {
+            Some(value) => {
+                *status = if value == want {
+                    STATUS_CONFIRMED
+                } else {
+                    STATUS_MISMATCH
+                }
+                .to_owned();
+            }
+            None if pending => *status = STATUS_UNREPORTED.to_owned(),
+            None => {}
+        }
+    }
+    s.settings_status = statuses;
+    s.settings_verify = VERIFY_IDLE.to_owned();
+    s.verify_reopen = false;
+}
+
+/// Settle a pending rename against the name the accessory just reported.
+/// `device.name` already holds that name, which is what the UI and the CLI
+/// show as the value the accessory kept.
+fn judge_name(s: &mut Snapshot) {
+    let Some(status) = s.settings_status.get_mut(NAME_KEY) else {
+        return;
+    };
+    if status != STATUS_VERIFYING && status != STATUS_UNREPORTED && status != STATUS_UNVERIFIED {
+        return;
+    }
+    let matches = s
+        .settings_requested
+        .get(NAME_KEY)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|want| want == s.device.name);
+    *status = if matches {
+        STATUS_CONFIRMED
+    } else {
+        STATUS_MISMATCH
+    }
+    .to_owned();
+}
+
+/// Give up on the pending readback without touching what the accessory did
+/// report. The write itself was sent; only its confirmation is lost.
+fn abandon_verification(s: &mut Snapshot) {
+    for status in s.settings_status.values_mut() {
+        if status == STATUS_VERIFYING {
+            *status = STATUS_UNVERIFIED.to_owned();
+        }
+    }
+    s.settings_verify = VERIFY_IDLE.to_owned();
+    s.verify_reopen = false;
+}
+
+/// A link ended. A reopen this daemon asked for to read settings back is not
+/// evidence of anything; any other loss ends the readback.
+fn link_lost(s: &mut Snapshot, aux: &mut Aux) {
+    aux.link_reports.clear();
+    if !s.verify_reopen {
+        abandon_verification(s);
+    }
+}
+
+fn mutate(s: &mut Snapshot, update: Update, primary_bud: PrimaryBud, aux: &mut Aux) {
     match update {
         Update::Identity {
             address,
@@ -261,18 +417,24 @@ fn mutate(
             if changed_device {
                 s.settings = DeviceSettings::default();
                 s.settings_report_seq.clear();
+                s.settings_requested.clear();
+                s.settings_status.clear();
+                s.settings_verify = VERIFY_IDLE.to_owned();
+                s.verify_reopen = false;
+                aux.link_reports.clear();
                 s.battery = crate::state::Battery {
                     stale: true,
                     ..Default::default()
                 };
                 s.ear = crate::state::Ear::default();
                 s.lid = crate::state::Lid::Unknown;
-                *last_ear = None;
+                aux.last_ear = None;
             }
             if changed_address {
                 // No property from the previous physical device may satisfy a
                 // model gate or look like confirmation for the new one.
                 s.device.name.clear();
+                aux.metadata_name = None;
                 s.device.model_id.clear();
                 s.device.model = None;
                 s.device.firmware = None;
@@ -280,7 +442,11 @@ fn mutate(
             }
             s.device.address = address;
             if let Some(n) = name {
-                s.device.name = n;
+                // BlueZ `Name`/`Alias` is a fallback only: it is read once per
+                // connection and never reflects a rename until the next one.
+                if aux.metadata_name.is_none() {
+                    s.device.name = n;
+                }
             }
             if let Some(id) = model_id {
                 s.device.model = models::model_name(&id).map(ToOwned::to_owned);
@@ -295,16 +461,20 @@ fn mutate(
                 invalidate_aap(s);
                 s.ear = crate::state::Ear::default();
                 s.settings = DeviceSettings::default();
-                *last_ear = None;
+                link_lost(s, aux);
+                aux.last_ear = None;
             }
         }
         Update::AapLink(up) => {
             s.device.aap_link = up;
             if up {
                 s.daemon.source = Source::Aap;
+                // `link_reports` is cleared when a link ends, not here: the
+                // opening dump arrives before the socket is promoted.
             } else {
                 invalidate_aap(s);
                 s.settings = DeviceSettings::default();
+                link_lost(s, aux);
             }
         }
         Update::Battery(entries) => {
@@ -319,7 +489,7 @@ fn mutate(
             // Presence is what resolves primary/secondary onto left/right, and
             // it can arrive after the ear packet that needs it. Redo the last
             // resolution now that we know which buds are out.
-            if let Some((primary, secondary)) = *last_ear {
+            if let Some((primary, secondary)) = aux.last_ear {
                 assign_ear(s, primary, secondary, primary_bud);
             }
         }
@@ -367,12 +537,22 @@ fn mutate(
             }
         }
         Update::Ear { primary, secondary } => {
-            *last_ear = Some((primary, secondary));
+            aux.last_ear = Some((primary, secondary));
             assign_ear(s, primary, secondary, primary_bud);
         }
         Update::Metadata(md) => {
             if let Some(n) = md.name {
+                // The device's own word on its name. Counted as a report for
+                // this link so the readback can tell a fresh answer from a
+                // name left over from an earlier one.
+                aux.metadata_name = Some(n.clone());
+                let counter = aux.link_reports.entry(NAME_KEY.to_owned()).or_default();
+                *counter = counter.saturating_add(1);
                 s.device.name = n;
+                // Judged here rather than only at the end of the readback
+                // window: metadata and the first battery packet arrive within
+                // milliseconds of each other and either order is legal.
+                judge_name(s);
             }
             if md.serial.is_some() {
                 s.device.serial = md.serial;
@@ -393,9 +573,39 @@ fn mutate(
                 .entry(setting.key().to_owned())
                 .or_default();
             *counter = counter.saturating_add(1);
+            let link_counter = aux
+                .link_reports
+                .entry(setting.key().to_owned())
+                .or_default();
+            *link_counter = link_counter.saturating_add(1);
             apply_setting(&mut s.settings, setting);
         }
+        Update::SettingRequested(setting) => {
+            let key = setting.key().to_owned();
+            s.settings_requested
+                .insert(key.clone(), setting.value_json());
+            s.settings_status.insert(key, STATUS_VERIFYING.to_owned());
+            s.settings_verify = VERIFY_SCHEDULED.to_owned();
+        }
+        Update::RenameRequested(name) => {
+            s.settings_requested
+                .insert(NAME_KEY.to_owned(), serde_json::Value::String(name));
+            s.settings_status
+                .insert(NAME_KEY.to_owned(), STATUS_VERIFYING.to_owned());
+            s.settings_verify = VERIFY_SCHEDULED.to_owned();
+        }
+        Update::VerifyReopening => {
+            s.settings_verify = VERIFY_REOPENING.to_owned();
+            s.verify_reopen = true;
+        }
+        Update::VerifyCompleted => {
+            finish_verification(s, &aux.link_reports, aux.metadata_name.as_deref())
+        }
+        Update::VerifyFailed => abandon_verification(s),
+        Update::Handoff(handoff) => s.handoff = handoff,
+        Update::Link(activity) => aux.link = activity,
     }
+    s.link = resolve_link(s.device.connected, aux.link.as_ref());
     s.battery.stale = ![&s.battery.left, &s.battery.right, &s.battery.case]
         .iter()
         .any(|c| c.fresh);
@@ -409,6 +619,29 @@ fn mutate(
     } else {
         Source::None
     };
+}
+
+/// Fold the link facts into the published object. A live link always wins:
+/// a sequence that has just succeeded may not have been retired yet, and the
+/// widget must never see `reconnecting` while the AirPods are connected.
+fn resolve_link(connected: bool, activity: Option<&LinkActivity>) -> Link {
+    if connected {
+        return Link {
+            status: LinkStatus::Connected,
+            reason: None,
+            attempt: 0,
+            since: None,
+        };
+    }
+    match activity {
+        Some(a) => Link {
+            status: LinkStatus::Reconnecting,
+            reason: Some(a.reason),
+            attempt: a.attempt,
+            since: Some(a.since.clone()),
+        },
+        None => Link::default(),
+    }
 }
 
 #[cfg(test)]
@@ -841,5 +1074,346 @@ mod tests {
         assert_eq!(snapshot.device.model, None);
         assert_eq!(snapshot.device.firmware, None);
         assert_eq!(snapshot.device.serial, None);
+    }
+
+    use crate::settings::{CallControls, HoldDuration, MicrophoneMode, PressSpeed, SettingCommand};
+
+    /// Bring a store to "link open, one setting written, reopen under way".
+    fn store_with_pending_write(command: SettingCommand) -> Arc<Store> {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::SettingRequested(command));
+        store
+    }
+
+    fn status(store: &Store, key: &str) -> String {
+        store
+            .snapshot()
+            .settings_status
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Bring a store to "link open, rename written, reopen under way".
+    fn store_with_pending_rename(name: &str) -> Arc<Store> {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::RenameRequested(name.to_owned()));
+        store
+    }
+
+    fn metadata_named(name: &str) -> Metadata {
+        Metadata {
+            name: Some(name.to_owned()),
+            ..Metadata::default()
+        }
+    }
+
+    #[test]
+    fn a_rename_the_accessory_reports_back_is_confirmed() {
+        let store = store_with_pending_rename("Airpods00000000");
+        let pending = store.snapshot();
+        assert_eq!(pending.settings_status[NAME_KEY], STATUS_VERIFYING);
+        assert_eq!(pending.settings_requested[NAME_KEY], "Airpods00000000");
+        assert_eq!(pending.settings_verify, VERIFY_SCHEDULED);
+
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        assert_eq!(status(&store, NAME_KEY), STATUS_VERIFYING);
+
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Metadata(metadata_named("Airpods00000000")));
+        store.apply(Update::VerifyCompleted);
+        let settled = store.snapshot();
+        assert_eq!(settled.settings_status[NAME_KEY], STATUS_CONFIRMED);
+        assert_eq!(settled.device.name, "Airpods00000000");
+        assert_eq!(settled.settings_verify, VERIFY_IDLE);
+    }
+
+    #[test]
+    fn a_rename_the_accessory_did_not_take_reports_the_name_it_kept() {
+        let store = store_with_pending_rename("Auris Pods");
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Metadata(metadata_named("Old Pods")));
+        store.apply(Update::VerifyCompleted);
+        let settled = store.snapshot();
+        assert_eq!(settled.settings_status[NAME_KEY], STATUS_MISMATCH);
+        // The name the device reported is what the UI and the CLI show.
+        assert_eq!(settled.device.name, "Old Pods");
+    }
+
+    #[test]
+    fn a_rename_no_metadata_answered_is_not_claimed_as_success() {
+        let store = store_with_pending_rename("Auris Pods");
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, NAME_KEY), STATUS_UNREPORTED);
+
+        // A later link that does report the name still settles it.
+        store.apply(Update::Metadata(metadata_named("Auris Pods")));
+        assert_eq!(status(&store, NAME_KEY), STATUS_CONFIRMED);
+    }
+
+    #[test]
+    fn the_accessory_name_outranks_the_bluez_name() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        // BlueZ `Name` or `Alias`, whichever changed, is the fallback.
+        store.apply(Update::Identity {
+            address: "AA:BB:CC:DD:EE:01".into(),
+            name: Some("Old Pods".into()),
+            model_id: None,
+        });
+        assert_eq!(store.snapshot().device.name, "Old Pods");
+
+        store.apply(Update::Metadata(metadata_named("Airpods00000000")));
+        assert_eq!(store.snapshot().device.name, "Airpods00000000");
+
+        // BlueZ only re-reads the remote name when a link opens, so a stale
+        // one must never overwrite the device's own word.
+        store.apply(Update::Identity {
+            address: "AA:BB:CC:DD:EE:01".into(),
+            name: Some("Old Pods".into()),
+            model_id: None,
+        });
+        assert_eq!(store.snapshot().device.name, "Airpods00000000");
+    }
+
+    #[test]
+    fn a_write_is_verifying_until_a_fresh_dump_reports_it() {
+        let store = store_with_pending_write(SettingCommand::PressSpeed(PressSpeed::Slower));
+        let pending = store.snapshot();
+        assert_eq!(pending.settings_status["press_speed"], STATUS_VERIFYING);
+        assert_eq!(pending.settings_requested["press_speed"], "slower");
+        assert_eq!(pending.settings_verify, VERIFY_SCHEDULED);
+        assert!(!pending.verify_reopen);
+
+        // The reopen this daemon asks for is not evidence of a lost readback.
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        let reopening = store.snapshot();
+        assert!(reopening.verify_reopen);
+        assert_eq!(reopening.settings_verify, VERIFY_REOPENING);
+        assert_eq!(reopening.settings_status["press_speed"], STATUS_VERIFYING);
+        assert_eq!(reopening.settings_requested["press_speed"], "slower");
+
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::PressSpeed(
+            PressSpeed::Slower,
+        )));
+        store.apply(Update::VerifyCompleted);
+        let done = store.snapshot();
+        assert_eq!(done.settings_status["press_speed"], STATUS_CONFIRMED);
+        assert_eq!(done.settings_verify, VERIFY_IDLE);
+        assert!(!done.verify_reopen);
+        assert_eq!(done.settings.press_speed, Some(PressSpeed::Slower));
+    }
+
+    #[test]
+    fn a_different_reported_value_is_a_mismatch_and_the_device_wins() {
+        let store = store_with_pending_write(SettingCommand::PressSpeed(PressSpeed::Slowest));
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::PressSpeed(
+            PressSpeed::Default,
+        )));
+        store.apply(Update::VerifyCompleted);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.settings_status["press_speed"], STATUS_MISMATCH);
+        assert_eq!(snapshot.settings.press_speed, Some(PressSpeed::Default));
+        assert_eq!(snapshot.settings_requested["press_speed"], "slowest");
+    }
+
+    #[test]
+    fn keys_this_model_never_reports_end_as_unreported() {
+        // Microphone and the listening-mode cycle are stored by AirPods 4
+        // (ANC) but are absent from every dump it sends.
+        let store = store_with_pending_write(SettingCommand::Microphone(MicrophoneMode::Left));
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::PressSpeed(
+            PressSpeed::Slower,
+        )));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, "microphone"), STATUS_UNREPORTED);
+        assert_eq!(store.snapshot().settings_verify, VERIFY_IDLE);
+    }
+
+    #[test]
+    fn a_report_from_an_earlier_link_cannot_confirm_a_later_write() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::PressSpeed(
+            PressSpeed::Slower,
+        )));
+        store.apply(Update::SettingRequested(SettingCommand::PressSpeed(
+            PressSpeed::Slower,
+        )));
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        // The lifetime counter is still non-zero, but this link said nothing.
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(store.snapshot().settings_report_seq["press_speed"], 1);
+        assert_eq!(status(&store, "press_speed"), STATUS_UNREPORTED);
+    }
+
+    #[test]
+    fn a_link_loss_outside_the_reopen_leaves_the_write_unverified() {
+        let store = store_with_pending_write(SettingCommand::PersonalizedVolume(true));
+        store.apply(Update::AclConnected(false));
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.settings_status["personalized_volume"],
+            STATUS_UNVERIFIED
+        );
+        assert_eq!(snapshot.settings_requested["personalized_volume"], true);
+        assert_eq!(snapshot.settings_verify, VERIFY_IDLE);
+        assert!(!snapshot.verify_reopen);
+    }
+
+    #[test]
+    fn an_expired_readback_budget_leaves_the_write_unverified() {
+        let store = store_with_pending_write(SettingCommand::HoldDuration(HoldDuration::Shorter));
+        store.apply(Update::VerifyReopening);
+        store.apply(Update::VerifyFailed);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.settings_status["hold_duration"], STATUS_UNVERIFIED);
+        assert_eq!(snapshot.settings_verify, VERIFY_IDLE);
+        assert!(!snapshot.verify_reopen);
+    }
+
+    #[test]
+    fn a_later_natural_dump_settles_an_unverified_write() {
+        let store = store_with_pending_write(SettingCommand::HoldDuration(HoldDuration::Shortest));
+        store.apply(Update::AapLink(false));
+        assert_eq!(status(&store, "hold_duration"), STATUS_UNVERIFIED);
+
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::HoldDuration(
+            HoldDuration::Shortest,
+        )));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, "hold_duration"), STATUS_CONFIRMED);
+
+        // A dump that says nothing about the key cannot undo that verdict.
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, "hold_duration"), STATUS_CONFIRMED);
+    }
+
+    #[test]
+    fn an_unreported_key_is_rechecked_by_every_later_dump() {
+        let store = store_with_pending_write(SettingCommand::CallControls(
+            CallControls::HangupOnceMuteTwice,
+        ));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, "call_controls"), STATUS_UNREPORTED);
+
+        store.apply(Update::AapLink(false));
+        store.apply(Update::AapLink(true));
+        store.apply(Update::Setting(SettingCommand::CallControls(
+            CallControls::MuteOnceHangupTwice,
+        )));
+        store.apply(Update::VerifyCompleted);
+        assert_eq!(status(&store, "call_controls"), STATUS_MISMATCH);
+    }
+
+    #[test]
+    fn a_completed_readback_with_nothing_pending_changes_nothing() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AapLink(true));
+        let before = store.snapshot();
+        store.apply(Update::VerifyCompleted);
+        let after = store.snapshot();
+        assert_eq!(before.updated_at, after.updated_at);
+        assert!(after.settings_status.is_empty());
+    }
+
+    #[test]
+    fn another_device_drops_every_request_from_the_previous_one() {
+        let store = store_with_pending_write(SettingCommand::PressSpeed(PressSpeed::Slower));
+        store.apply(Update::Identity {
+            address: "AA:BB:CC:DD:EE:02".into(),
+            name: None,
+            model_id: None,
+        });
+        let snapshot = store.snapshot();
+        assert!(snapshot.settings_requested.is_empty());
+        assert!(snapshot.settings_status.is_empty());
+        assert_eq!(snapshot.settings_verify, VERIFY_IDLE);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn reconnecting(reason: LinkReason, attempt: u32) -> LinkActivity {
+        LinkActivity {
+            reason,
+            attempt,
+            since: "2026-09-16T02:01:47Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_scheduled_rejoin_publishes_reconnecting_and_link_up_clears_it() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        assert_eq!(store.snapshot().link.status, LinkStatus::Disconnected);
+
+        store.apply(Update::Link(Some(reconnecting(LinkReason::TakenOver, 0))));
+        let link = store.snapshot().link;
+        assert_eq!(link.status, LinkStatus::Reconnecting);
+        assert_eq!(link.reason, Some(LinkReason::TakenOver));
+        assert_eq!(link.attempt, 0);
+        assert_eq!(link.since.as_deref(), Some("2026-09-16T02:01:47Z"));
+
+        // The connect starts: only the attempt counter moves.
+        store.apply(Update::Link(Some(reconnecting(LinkReason::TakenOver, 1))));
+        assert_eq!(store.snapshot().link.attempt, 1);
+
+        // BlueZ reports the link before the session retires the sequence.
+        store.apply(Update::AclConnected(true));
+        let link = store.snapshot().link;
+        assert_eq!(link.status, LinkStatus::Connected);
+        assert!(link.reason.is_none());
+        assert!(link.since.is_none());
+        assert_eq!(link.attempt, 0);
+    }
+
+    #[test]
+    fn giving_up_leaves_a_plain_disconnected_link() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::AclConnected(false));
+        store.apply(Update::Link(Some(reconnecting(LinkReason::LinkLost, 3))));
+        assert_eq!(store.snapshot().link.status, LinkStatus::Reconnecting);
+        store.apply(Update::Link(None));
+        assert_eq!(store.snapshot().link, Link::default());
+    }
+
+    #[test]
+    fn a_connected_link_never_reports_a_reconnect() {
+        let store = Store::new(Snapshot::initial("AA:BB:CC:DD:EE:01"), PrimaryBud::Auto);
+        store.apply(Update::AclConnected(true));
+        store.apply(Update::Link(Some(reconnecting(LinkReason::AutoConnect, 2))));
+        assert_eq!(store.snapshot().link.status, LinkStatus::Connected);
+        // The sequence survives in the bookkeeping: the drop republishes it.
+        store.apply(Update::AclConnected(false));
+        let link = store.snapshot().link;
+        assert_eq!(link.status, LinkStatus::Reconnecting);
+        assert_eq!(link.reason, Some(LinkReason::AutoConnect));
+        assert_eq!(link.attempt, 2);
     }
 }

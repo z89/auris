@@ -20,7 +20,7 @@ PluginComponent {
 
     // Bump on development deployments: a reload acknowledgement alone does
     // not prove the live widget was recreated from the current source.
-    readonly property string uiRevision: "2026-09-13.14-input-updates"
+    readonly property string uiRevision: "2026-09-16.1-panel-auto-close"
     Component.onCompleted: console.info("auris: UI loaded revision", uiRevision)
     Component.onDestruction: console.info("auris: UI unloaded revision", uiRevision)
 
@@ -68,9 +68,11 @@ PluginComponent {
     // are independent by key so editing microphone never blocks a rename.
     property var pendingAdvanced: ({})
     property int pendingAdvancedSerial: 0
-    property bool advancedReadbackActive: false
-    property bool advancedReadbackSawDown: false
-    property int advancedReadbackSerial: 0
+    // Keys whose daemon status turned "confirmed", against the moment it did.
+    // The caption fades about four seconds later; the control keeps the value,
+    // which by then is the device's own.
+    property var settingConfirmedAt: ({})
+    property int confirmedFadeTick: 0
     property string advancedStatusKind: ""
     property string advancedStatusText: ""
     property string advancedToastKind: ""
@@ -83,15 +85,19 @@ PluginComponent {
         return JSON.stringify(left) === JSON.stringify(right);
     }
 
-    function pendingAdvancedFor(key) {
-        return pendingAdvanced && pendingAdvanced[key] ? pendingAdvanced[key] : null;
+    // The daemon publishes a rename under the key "name", in the same
+    // settings_requested/settings_status maps it uses for every other write it
+    // verifies. This panel has always called that control "rename".
+    function daemonKeyOf(key) {
+        return key === "rename" ? "name" : key;
     }
 
-    function hasAwaitingAdvanced() {
-        return Object.keys(pendingAdvanced || {}).some(key => {
-            const state = pendingAdvanced[key].state;
-            return state === "awaiting" || state === "verifying";
-        });
+    function uiKeyOf(key) {
+        return key === "name" ? "rename" : key;
+    }
+
+    function pendingAdvancedFor(key) {
+        return pendingAdvanced && pendingAdvanced[key] ? pendingAdvanced[key] : null;
     }
 
     function setAdvancedPending(key, entry) {
@@ -157,41 +163,83 @@ PluginComponent {
     function cancelAdvancedPending(reason) {
         if (Object.keys(pendingAdvanced || {}).length === 0)
             return;
-        advancedReadbackActive = false;
-        advancedReadbackSawDown = false;
-        advancedReadbackTimeout.stop();
         pendingAdvancedSerial++;
         clearAdvancedPending();
         showAdvancedToast("error", reason);
     }
 
+    // From settings_api 2 the daemon verifies its own writes: a settings
+    // request lives in settings_requested with a status of its own, so the local
+    // entry exists only to serialise commands and is retired as soon as the
+    // daemon has taken the value over. From settings_api 3 a rename is one of
+    // them, verified from the accessory's own metadata. Older daemons report a
+    // rename only as a changed device name, whenever BlueZ next reads one, so
+    // that match stays here as a fallback.
     function confirmAdvancedSnapshot(obj) {
-        let confirmed = false;
-        let legacyMatch = false;
+        const statuses = obj && obj.settings_status && typeof obj.settings_status === "object" ? obj.settings_status : null;
+        const requested = obj && obj.settings_requested && typeof obj.settings_requested === "object" ? obj.settings_requested : null;
         for (const key of Object.keys(pendingAdvanced || {})) {
             const request = pendingAdvanced[key];
-            if (!request || request.queued)
+            if (!request || request.queued || request.state === "sending")
                 continue;
-            const matches = key === "rename" ? !!obj.device && obj.device.name === request.target : !!obj.settings && obj.settings[key] !== null && obj.settings[key] !== undefined && advancedTargetsEqual(key, obj.settings[key], request.target);
-            if (matches) {
-                const sequence = settingsReportSequenceFor(obj, key);
-                // A battery-driven snapshot can repeat the prior setting. When
-                // the daemon supplies counters, only a newer report confirms a
-                // request made against that counter.
-                if (request.reportSequence !== null && (sequence === null || sequence <= request.reportSequence))
-                    continue;
-                console.info("auris: setting report matched", key, "report", sequence);
+            const daemonKey = daemonKeyOf(key);
+            if (statuses && typeof statuses[daemonKey] === "string" && statuses[daemonKey].length > 0 && requested && advancedTargetsEqual(key, requested[daemonKey], request.target)) {
+                console.info("auris: setting handed to daemon verification", key, statuses[daemonKey]);
                 clearAdvancedPending(key);
-                if (request.reportSequence === null)
-                    legacyMatch = true;
-                else
-                    confirmed = true;
+                if (key === "rename" && statuses[daemonKey] === "confirmed")
+                    showAdvancedToast("success", "Confirmed by the AirPods.");
+                continue;
+            }
+            if (key === "rename" && obj.device && obj.device.name === request.target) {
+                console.info("auris: rename echoed by the device");
+                clearAdvancedPending(key);
+                showAdvancedToast("success", "Confirmed by the AirPods.");
             }
         }
-        if (confirmed)
-            showAdvancedToast("success", "Confirmed by the AirPods.");
-        else if (legacyMatch)
-            showAdvancedToast("pending", "Matches the reported value; this daemon cannot timestamp the echo.");
+    }
+
+    // Remember when each key first appeared as confirmed, so the caption can
+    // fade on its own. Called with the incoming snapshot while `st` is still the
+    // previous one, which is what makes the transition observable.
+    function noteConfirmedStatuses(obj) {
+        const statuses = obj && obj.settings_status && typeof obj.settings_status === "object" ? obj.settings_status : null;
+        const previous = settingConfirmedAt || {};
+        const now = Date.now();
+        const next = {};
+        if (statuses) {
+            for (const key of Object.keys(statuses)) {
+                if (statuses[key] !== "confirmed")
+                    continue;
+                const wasConfirmed = settingsStatus !== null && settingsStatus[key] === "confirmed";
+                next[key] = wasConfirmed && typeof previous[key] === "number" ? previous[key] : now;
+            }
+        }
+        settingConfirmedAt = next;
+    }
+
+    // The daemon only tells us when a switch happened. A caption belongs to
+    // the moment `at` changes; an event already present on the first snapshot
+    // after load is history unless it is only seconds old.
+    function noteHandoffEvent(obj, hadState) {
+        const handoffObj = obj.handoff && typeof obj.handoff === "object" ? obj.handoff : null;
+        const event = handoffObj && handoffObj.last_event && typeof handoffObj.last_event === "object" ? handoffObj.last_event : null;
+        const at = event && typeof event.at === "string" ? event.at : "";
+        if (at === handoffEventAt)
+            return;
+        handoffEventAt = at;
+        if (at.length === 0)
+            return;
+        const age = Date.now() - Date.parse(at);
+        if (!hadState && !(Math.abs(age) < handoffCaptionMs))
+            return;
+        handoffEventKind = typeof event.kind === "string" ? event.kind : "";
+        handoffCaptionTimer.restart();
+    }
+
+    // Audio moved to another Apple device: A2DP may drop while the AAP link
+    // stays up. That is not a disconnect for anything on screen.
+    function handedOffSnapshot(obj) {
+        return !!obj && !!obj.device && obj.device.aap_link === true && !!obj.handoff && typeof obj.handoff === "object" && obj.handoff.owner === "other";
     }
 
     function parseState(content) {
@@ -218,8 +266,10 @@ PluginComponent {
             const newAapLink = newDevice !== null && newDevice.aap_link === true;
             const newSettingsApi = typeof obj.settings_api === "number" ? obj.settings_api : 0;
             const sessionChanged = hadState && (oldAddress !== newAddress || oldModelId !== newModelId || oldAapLink !== newAapLink || oldSettingsApi !== newSettingsApi);
+            noteConfirmedStatuses(obj);
             st = obj;
             daemonUp = true;
+            noteHandoffEvent(obj, hadState);
             if (sessionChanged && Object.keys(pendingAdvanced || {}).length === 0) {
                 advancedStatusKind = "";
                 advancedStatusText = "";
@@ -228,14 +278,22 @@ PluginComponent {
                 pendingNoise = "";
                 pendingNoiseTimeout.stop();
             }
-            if (!obj.device || obj.device.connected !== true) {
+            // The daemon drops and reopens the AAP link to read a write back.
+            // connected and aap_link both flick false for about a second while it
+            // does; that is a verification step, not a disconnect, and nothing
+            // pending may be cancelled because of it.
+            // A scheduled reconnect is the same kind of pause: the daemon is
+            // holding the link open on the user's behalf, so a pending write
+            // waits for the answer rather than being cancelled.
+            const reconnecting = obj.link !== null && typeof obj.link === "object" && obj.link.status === "reconnecting";
+            if (obj.verify_reopen === true || reconnecting) {
+                confirmAdvancedSnapshot(obj);
+            } else if (!obj.device || (obj.device.connected !== true && !handedOffSnapshot(obj))) {
                 cancelAdvancedPending("Request cancelled because the AirPods disconnected.");
             } else if (obj.settings_api === undefined || obj.settings_api < 1) {
                 cancelAdvancedPending("Request cancelled because this aurisd does not support device settings.");
             } else if (obj.device.model_id !== "201B") {
                 cancelAdvancedPending("Request cancelled because the connected device changed.");
-            } else if (obj.device.aap_link !== true && advancedReadbackActive) {
-                advancedReadbackSawDown = true;
             } else if (obj.device.aap_link !== true) {
                 cancelAdvancedPending("Request cancelled because the AirPods settings link closed.");
             } else {
@@ -247,11 +305,6 @@ PluginComponent {
                     }
                 }
                 confirmAdvancedSnapshot(obj);
-                if (advancedReadbackActive && advancedReadbackSawDown) {
-                    advancedReadbackActive = false;
-                    advancedReadbackSawDown = false;
-                    advancedReadbackTimeout.stop();
-                }
             }
             return true;
         } catch (e) {
@@ -359,42 +412,24 @@ PluginComponent {
         onTriggered: root.pendingNoise = ""
     }
 
-    // A missing device echo is useful information, not a failed write. Keep the
-    // per-key requested value until a matching report or a session change.
+    // The "Confirmed" caption is transient. Tick while one is on screen so the
+    // captions can retire themselves; the binding stops the timer once the last
+    // one has aged out, so an idle panel costs nothing.
     Timer {
-        id: advancedPendingWatch
+        id: confirmedFadeTimer
 
-        interval: 500
+        interval: 250
         repeat: true
-        running: root.hasAwaitingAdvanced()
-        onTriggered: {
-            const now = Date.now();
-            root.maybeStartAdvancedReadback(now);
-            for (const key of Object.keys(root.pendingAdvanced || {})) {
-                const request = root.pendingAdvanced[key];
-                if (request && (request.state === "awaiting" || request.state === "verifying") && now - request.sentAt >= 5000) {
-                    request.state = "unconfirmed";
-                    root.setAdvancedPending(key, request);
-                    console.info("auris: setting confirmation timed out", key);
-                    root.showAdvancedToast("warning", "Sent; no device report yet.");
-                }
-            }
-            if (root.advancedReadbackActive && !root.advancedReadbackSawDown && !Object.keys(root.pendingAdvanced || {}).some(key => root.pendingAdvanced[key].state === "verifying")) {
-                root.advancedReadbackActive = false;
-                advancedReadbackTimeout.stop();
-            }
-        }
+        running: root.anyConfirmedCaption
+        onTriggered: root.confirmedFadeTick = (root.confirmedFadeTick + 1) % 100000
     }
 
     Timer {
-        id: advancedReadbackTimeout
+        id: handoffCaptionTimer
 
-        interval: 10000
+        interval: root.handoffCaptionMs
         repeat: false
-        onTriggered: {
-            root.advancedReadbackActive = false;
-            root.advancedReadbackSawDown = false;
-        }
+        onTriggered: root.handoffEventKind = ""
     }
 
     Timer {
@@ -427,7 +462,62 @@ PluginComponent {
     readonly property var bat: st && st.battery ? st.battery : null
     readonly property var ear: st && st.ear ? st.ear : null
 
-    readonly property bool connected: dev !== null && dev.connected === true
+    // ---- link healing ------------------------------------------------------
+    //
+    // The daemon publishes `link` from the moment it schedules a reconnect
+    // until the link is back or it gives up. Older daemons omit the object
+    // entirely, and every property below then reads as it did before it
+    // existed, so nothing on screen changes for them.
+    readonly property var link: st && st.link && typeof st.link === "object" ? st.link : null
+    readonly property string linkStatus: link && typeof link.status === "string" ? link.status : ""
+    readonly property bool linkReconnecting: linkStatus === "reconnecting"
+    readonly property string linkReason: link && typeof link.reason === "string" ? link.reason : ""
+    readonly property int linkAttempt: link && typeof link.attempt === "number" ? link.attempt : 0
+    // One line, only while the daemon is actually healing the link. The
+    // daemon's reason is an inference from Bluetooth events rather than
+    // something it is told, and printing it stated a cause nobody had
+    // established: buds put back in the case came up as "taken over". The
+    // caption now says only what is known, and the attempt count is worth
+    // reading only once a first try has already failed. linkReason stays
+    // readable for diagnostics, but nothing on screen is derived from it.
+    readonly property string linkStatusText: {
+        if (!linkReconnecting)
+            return "";
+        const base = "Attempting to reconnect";
+        return linkAttempt > 1 ? base + " \u00b7 attempt " + linkAttempt : base;
+    }
+    // A disconnect nobody has explained yet. The daemon can take a moment to
+    // decide that a dropped link is worth rejoining, and the module blinking
+    // out and back in that window reads as the AirPods having gone. Hold it on
+    // screen for two seconds; a reconnect that is announced keeps it up through
+    // linkReconnecting instead.
+    property bool disconnectGrace: false
+    readonly property int disconnectGraceMs: 2000
+
+    onConnectedChanged: {
+        if (connected) {
+            disconnectGrace = false;
+            disconnectGraceTimer.stop();
+        } else if (daemonUp) {
+            disconnectGrace = true;
+            disconnectGraceTimer.restart();
+        }
+    }
+
+    Timer {
+        id: disconnectGraceTimer
+        interval: root.disconnectGraceMs
+        repeat: false
+        onTriggered: root.disconnectGrace = false
+    }
+
+    // Raw device connection. The daemon briefly reopens the AAP link to read a
+    // settings write back, and reports connected/aap_link false for about a
+    // second while it does. Nothing on screen may treat that as a disconnect, so
+    // `connected` folds the reopen window back in and everything else uses it.
+    readonly property bool deviceConnected: dev !== null && dev.connected === true
+    readonly property bool verifyReopen: st !== null && st.verify_reopen === true
+    readonly property bool connected: deviceConnected || verifyReopen || handoffHeldElsewhere || linkReconnecting
     readonly property string deviceName: dev && dev.name ? dev.name : "AirPods"
     readonly property string model: dev && dev.model ? dev.model : ""
     readonly property string firmware: dev && dev.firmware ? dev.firmware : ""
@@ -435,29 +525,282 @@ PluginComponent {
 
     readonly property int settingsApi: st && typeof st.settings_api === "number" ? st.settings_api : 0
     readonly property var confirmedSettings: st && st.settings && typeof st.settings === "object" ? st.settings : null
-    readonly property var settingsReportSeq: st && st.settings_report_seq && typeof st.settings_report_seq === "object" ? st.settings_report_seq : null
+    readonly property var settingsRequested: st && st.settings_requested && typeof st.settings_requested === "object" ? st.settings_requested : null
+    readonly property var settingsStatus: st && st.settings_status && typeof st.settings_status === "object" ? st.settings_status : null
+    readonly property string settingsVerify: st && typeof st.settings_verify === "string" ? st.settings_verify : "idle"
+    // settings_api 2 is the first daemon that verifies its own writes. Older
+    // ones report device values only, and this plugin then says nothing about
+    // whether a write landed rather than guessing from a timeout.
+    readonly property bool settingsVerified: settingsApi >= 2
+    // settings_api 3 is the first daemon that verifies a rename from the
+    // accessory's own metadata instead of leaving it to the BlueZ name, which
+    // only refreshes on the next connection.
+    readonly property bool renameVerified: settingsApi >= 3
+    readonly property int confirmedCaptionMs: 4000
     readonly property bool advancedTargetModel: dev !== null && dev.model_id === "201B"
-    readonly property bool advancedAapLinked: dev !== null && dev.aap_link === true
+    readonly property bool advancedAapLinked: dev !== null && (dev.aap_link === true || verifyReopen)
     readonly property bool advancedAvailable: daemonUp && connected && settingsApi >= 1 && advancedTargetModel && advancedAapLinked
     readonly property string confirmedDeviceName: dev && typeof dev.name === "string" ? dev.name : ""
 
+    // ---- seamless switching ------------------------------------------------
+    //
+    // Older daemons omit `handoff`; everything below then stays inert.
+    readonly property var handoff: st && st.handoff && typeof st.handoff === "object" ? st.handoff : null
+    readonly property bool handoffAvailable: daemonUp && handoff !== null
+    readonly property bool handoffHeldElsewhere: handedOffSnapshot(st)
+    readonly property var handoffSource: handoff && handoff.audio_source && typeof handoff.audio_source === "object" ? handoff.audio_source : null
+    // Each binding guards its own inputs: Qt may evaluate one before the
+    // property it reads has caught up with a new snapshot.
+    readonly property bool handoffRemotePlaying: daemonUp && handoff !== null && handoff.owner !== "local" && handoffSource !== null && handoffSource.is_local === false && (handoffSource.state === "media" || handoffSource.state === "call")
+    readonly property bool handoffRemoteCall: handoffRemotePlaying && handoffSource !== null && handoffSource.state === "call"
+    readonly property int handoffCaptionMs: 4000
+    property string handoffEventAt: ""
+    property string handoffEventKind: ""
+    readonly property string handoffCaption: {
+        if (!handoffAvailable)
+            return "";
+        switch (handoffEventKind) {
+        case "yielded":
+            return "Moved to your other device";
+        case "took_over":
+            return "Moved here";
+        case "yield_requested":
+            return "Handing off\u2026";
+        default:
+            return "";
+        }
+    }
+    readonly property string handoffRowText: handoffCaption.length > 0 ? handoffCaption : !handoffRemotePlaying ? "" : handoffRemoteCall ? "On a call on another device" : "Playing on another device"
+    readonly property string handoffRowIcon: {
+        switch (handoffCaption.length > 0 ? handoffEventKind : "") {
+        case "yielded":
+            return "phonelink";
+        case "took_over":
+            return "headphones";
+        case "yield_requested":
+            return "swap_horiz";
+        default:
+            return handoffRemoteCall ? "call" : "devices";
+        }
+    }
+    readonly property bool handoffCardVisible: handoffRowText.length > 0
+
     function confirmedSetting(key) {
+        // The device's own name is the reported value for a rename: the daemon
+        // prefers the accessory's metadata name over the BlueZ one.
+        if (key === "rename")
+            return confirmedDeviceName.length > 0 ? confirmedDeviceName : null;
         if (!confirmedSettings || confirmedSettings[key] === undefined || confirmedSettings[key] === null)
             return null;
         return confirmedSettings[key];
     }
 
-    function settingsReportSequenceFor(snapshot, key) {
-        const sequences = snapshot && snapshot.settings_report_seq;
-        if (!sequences || typeof sequences !== "object")
-            return null;
-        return typeof sequences[key] === "number" ? sequences[key] : 0;
+    function keyVerified(key) {
+        return key === "rename" ? renameVerified : settingsVerified;
     }
 
-    function settingsReportSequence(key) {
-        if (!settingsReportSeq)
+    function settingStatusOf(key) {
+        if (!keyVerified(key) || !settingsStatus)
+            return "";
+        const daemonKey = daemonKeyOf(key);
+        return typeof settingsStatus[daemonKey] === "string" ? settingsStatus[daemonKey] : "";
+    }
+
+    function requestedSetting(key) {
+        if (!keyVerified(key) || !settingsRequested)
             return null;
-        return typeof settingsReportSeq[key] === "number" ? settingsReportSeq[key] : 0;
+        const daemonKey = daemonKeyOf(key);
+        if (settingsRequested[daemonKey] === undefined || settingsRequested[daemonKey] === null)
+            return null;
+        return settingsRequested[daemonKey];
+    }
+
+    // What a control shows: the value the daemon is carrying for us whenever it
+    // has a status for the key, so nothing snaps back to the old value while
+    // verification is in flight. A mismatch is the one case where the device
+    // won, and its own value is then the honest thing to show.
+    function effectiveSetting(key) {
+        const status = settingStatusOf(key);
+        if (status.length > 0 && status !== "mismatch") {
+            const requested = requestedSetting(key);
+            if (requested !== null)
+                return requested;
+        }
+        return confirmedSetting(key);
+    }
+
+    function confirmedCaptionVisible(key) {
+        void confirmedFadeTick;
+        const at = settingConfirmedAt || {};
+        const daemonKey = daemonKeyOf(key);
+        return typeof at[daemonKey] === "number" && Date.now() - at[daemonKey] < confirmedCaptionMs;
+    }
+
+    readonly property bool anyConfirmedCaption: {
+        void confirmedFadeTick;
+        const at = settingConfirmedAt || {};
+        const now = Date.now();
+        return Object.keys(at).some(key => now - at[key] < confirmedCaptionMs);
+    }
+
+    function humaniseSetting(key, value) {
+        if (value === null || value === undefined)
+            return "its own value";
+        if (key === "listening_mode_cycle") {
+            const cycle = normalizeListeningCycle(value).map(mode => cycleModeLabel(mode));
+            return cycle.length > 0 ? cycle.join(" · ") : "its own cycle";
+        }
+        if (key === "personalized_volume")
+            return value === true ? "On" : value === false ? "Off" : String(value);
+        const table = settingValueLabels[key];
+        const label = table ? table[String(value)] : undefined;
+        return label !== undefined ? label : String(value);
+    }
+
+    function cycleModeLabel(mode) {
+        switch (mode) {
+        case "off":
+            return "Off";
+        case "anc":
+            return "ANC";
+        case "transparency":
+            return "Transparency";
+        case "adaptive":
+            return "Adaptive";
+        }
+        return mode;
+    }
+
+    // Same wording the settings component puts on its buttons, so "AirPods kept
+    // Slower" names something the user can see on screen.
+    readonly property var settingValueLabels: ({
+            "microphone": {
+                "auto": "Auto",
+                "left": "Left",
+                "right": "Right"
+            },
+            "press_speed": {
+                "default": "Default",
+                "slower": "Slower",
+                "slowest": "Slowest"
+            },
+            "hold_duration": {
+                "default": "Default",
+                "shorter": "Shorter",
+                "shortest": "Shortest"
+            },
+            "call_controls": {
+                "mute_once_hangup_twice": "1\u00d7 mute \u00b7 2\u00d7 end call",
+                "hangup_once_mute_twice": "1\u00d7 end call \u00b7 2\u00d7 mute"
+            }
+        })
+
+    // One caption per control, and only where the daemon has something to say.
+    function settingCaptionText(key) {
+        switch (settingStatusOf(key)) {
+        case "verifying":
+            return "Verifying with AirPods\u2026";
+        case "confirmed":
+            return confirmedCaptionVisible(key) ? "Confirmed" : "";
+        case "mismatch":
+            return "AirPods kept " + humaniseSetting(key, confirmedSetting(key));
+        case "unreported":
+            return key === "rename" ? "Sent. The AirPods did not report the name back." : "Applied. AirPods 4 doesn't report this setting back.";
+        case "unverified":
+            return "Sent, not verified";
+        }
+        return "";
+    }
+
+    function settingCaptionColor(key) {
+        const status = settingStatusOf(key);
+        if (status === "mismatch")
+            return Theme.error;
+        if (status === "unverified")
+            return Theme.warning;
+        return Theme.surfaceVariantText;
+    }
+
+    // Captions, keyed by setting: one short line stating what the daemon's own
+    // verification found. The settings component renders them under its
+    // controls; it is fed this map only when its version understands it, so an
+    // older component keeps working and simply shows no caption.
+    readonly property var advancedCaptions: {
+        void confirmedFadeTick;
+        const out = {};
+        if (settingsVerified && settingsStatus) {
+            for (const daemonKey of Object.keys(settingsStatus)) {
+                const key = uiKeyOf(daemonKey);
+                const text = settingCaptionText(key);
+                if (text.length === 0)
+                    continue;
+                out[key] = {
+                    "text": text,
+                    "color": settingCaptionColor(key)
+                };
+            }
+        }
+        const local = pendingAdvanced || {};
+        for (const key of Object.keys(local)) {
+            const request = local[key];
+            if (!request || request.state === "sending" || !keyVerified(key))
+                continue;
+            // Between the command's exit and the daemon's first status for it,
+            // the write is already on its way to be verified. Saying so is more
+            // accurate than a gap and stops the caption flickering into place.
+            if (out[key] === undefined)
+                out[key] = {
+                    "text": "Verifying with AirPods\u2026",
+                    "color": Theme.surfaceVariantText
+                };
+        }
+        return out;
+    }
+
+    // The map handed to the settings component as its pendingRequests. It holds
+    // only requests this plugin is still carrying itself: a command in flight,
+    // and a rename, which the device echoes. Everything the daemon has taken
+    // over is absent, because effectiveSetting already puts the right value in
+    // front of the control and advancedCaptions says what is happening to it.
+    readonly property var advancedRequests: {
+        const out = {};
+        if (settingsVerified && settingsStatus) {
+            for (const daemonKey of Object.keys(settingsStatus)) {
+                const key = uiKeyOf(daemonKey);
+                if (settingStatusOf(key) !== "verifying")
+                    continue;
+                const requested = requestedSetting(key);
+                if (requested === null)
+                    continue;
+                out[key] = {
+                    "state": "verifying",
+                    "target": requested,
+                    "deviceValue": confirmedSetting(key)
+                };
+            }
+        }
+        const local = pendingAdvanced || {};
+        for (const key of Object.keys(local)) {
+            const request = local[key];
+            if (!request)
+                continue;
+            if (key === "rename" && !renameVerified) {
+                out[key] = {
+                    "state": request.state,
+                    "target": request.target,
+                    "deviceValue": confirmedDeviceName
+                };
+                continue;
+            }
+            if (out[key] !== undefined && request.state !== "sending")
+                continue;
+            out[key] = {
+                "state": request.state === "sending" ? "sending" : "verifying",
+                "target": request.target,
+                "deviceValue": confirmedSetting(key)
+            };
+        }
+        return out;
     }
 
     readonly property string advancedUnavailableReason: {
@@ -505,9 +848,12 @@ PluginComponent {
             return false;
         // New daemons report freshness per cell. Older snapshots have only a
         // battery-wide stale bit, so retain their established present fallback.
+        // A readback reopen costs the daemon its live reports for about a
+        // second. Holding the last freshness across that window is what keeps
+        // the bar pill from blinking out and back for a verification step.
         if (typeof s.fresh === "boolean")
-            return s.fresh;
-        return !(bat && bat.stale === true);
+            return s.fresh || verifyReopen;
+        return !(bat && bat.stale === true && !verifyReopen);
     }
     // Level only while the component is reporting right now; the bar pill
     // must not show a number that could be hours old.
@@ -584,7 +930,10 @@ PluginComponent {
         return (observation ? observation + " · " : "") + (earOf(side) === "out" ? "out of ear" : "ear status unknown");
     }
     function cellDim(side) {
-        return !cellLive(side) || (side !== "case" && !charging(side) && earOf(side) === "out");
+        // While the link is healing the last reading is still the best one
+        // there is, so the row keeps it and says so by dimming instead of
+        // blanking out.
+        return linkReconnecting || !cellLive(side) || (side !== "case" && !charging(side) && earOf(side) === "out");
     }
 
     readonly property int leftLevel: barBudPresent("left") ? level("left") : -1
@@ -634,7 +983,7 @@ PluginComponent {
     // Deliberately not a function of ageSec: the daemon only rewrites state.json
     // when a field changes, so a healthy idle link produces an arbitrarily old
     // file. Staleness comes from the daemon's own flag instead.
-    readonly property bool stale: !daemonUp || !connected || (bat !== null && bat.stale === true)
+    readonly property bool stale: !daemonUp || !connected || linkReconnecting || (bat !== null && bat.stale === true && !verifyReopen)
 
     function ageText() {
         if (ageSec < 0)
@@ -718,6 +1067,9 @@ PluginComponent {
     }
 
     readonly property color pillColor: dimmed(levelColor(pillLevel, false))
+    // Subtle, not an alarm: the module is still showing real readings while
+    // the daemon rejoins, and the fade says only that they are being held.
+    readonly property real barContentOpacity: linkReconnecting ? 0.55 : 1
     readonly property string pillText: pillLevel >= 0 ? pillLevel + "%" : "--"
 
     readonly property string noiseIcon: {
@@ -780,42 +1132,6 @@ PluginComponent {
         showAdvancedToast("error", message);
     }
 
-    function maybeStartAdvancedReadback(now) {
-        if (advancedReadbackActive)
-            return false;
-        let found = false;
-        const next = {};
-        for (const key of Object.keys(pendingAdvanced || {})) {
-            const request = pendingAdvanced[key];
-            if (request && request.state === "awaiting" && !request.readbackAttempted && now - request.sentAt >= 1000) {
-                request.readbackAttempted = true;
-                request.state = "verifying";
-                found = true;
-            }
-            next[key] = request;
-        }
-        if (!found)
-            return false;
-        pendingAdvanced = next;
-        advancedReadbackActive = true;
-        advancedReadbackSawDown = false;
-        advancedReadbackTimeout.restart();
-        const serial = ++advancedReadbackSerial;
-        console.info("auris: reopening control link for setting readback", serial);
-        const argv = ["sh", "-c", "PATH=\"$HOME/.local/bin:$PATH\" exec \"$0\" \"$@\"", ctlCommand, "reconnect"];
-        Proc.runCommand("auris.ctl.advanced.readback." + serial, argv, (stdout, exitCode) => {
-            if (serial !== root.advancedReadbackSerial)
-                return;
-            if (exitCode !== 0) {
-                root.advancedReadbackActive = false;
-                root.advancedReadbackSawDown = false;
-                advancedReadbackTimeout.stop();
-                root.showAdvancedToast("warning", "Setting sent, but its readback could not be refreshed.");
-            }
-        });
-        return true;
-    }
-
     function startAdvancedCommand(key, request, target, args) {
         const commandSerial = ++pendingAdvancedSerial;
         request.target = target;
@@ -823,7 +1139,6 @@ PluginComponent {
         request.state = "sending";
         request.inFlightSerial = commandSerial;
         request.sentAt = 0;
-        request.reportSequence = key === "rename" ? null : settingsReportSequence(key);
         setAdvancedPending(key, request);
         // Deliberately log keys/lifecycle only, never names or preference values.
         console.info("auris: setting command started", key, "request", commandSerial);
@@ -852,8 +1167,19 @@ PluginComponent {
             current.inFlightSerial = 0;
             current.state = "awaiting";
             current.sentAt = Date.now();
+            // A rename on a daemon that cannot verify one is the exception:
+            // there is still the reported name to wait for.
+            const awaitsReportedName = key === "rename" && !root.renameVerified;
+            if (!root.settingsVerified && !awaitsReportedName) {
+                // Pre-verification daemons never report these settings back, so
+                // there is nothing to wait for: show the device's own values and
+                // say nothing about a write we cannot check.
+                root.clearAdvancedPending(key);
+                return;
+            }
             root.setAdvancedPending(key, current);
-            root.showAdvancedToast("pending", "Sent; waiting for a device report.");
+            if (key === "rename" && !root.renameVerified)
+                root.showAdvancedToast("pending", "Sent; waiting for the AirPods to report the name.");
             if (!root.socketStreaming)
                 fallbackCommandRefresh.restart();
         });
@@ -885,8 +1211,6 @@ PluginComponent {
             "state": "sending",
             "inFlightSerial": 0,
             "sentAt": 0,
-            "reportSequence": null,
-            "readbackAttempted": false,
             "queued": null
         };
         startAdvancedCommand(key, request, target, args);
@@ -938,6 +1262,15 @@ PluginComponent {
     function reconnect() {
         ctl(["reconnect"]);
     }
+    function setHandoff(on) {
+        ctl(["handoff", on ? "on" : "off"]);
+    }
+    function takeOver() {
+        ctl(["take-over"]);
+    }
+    function yieldAudio() {
+        ctl(["yield"]);
+    }
 
     readonly property var noiseModes: ["off", "anc", "transparency", "adaptive"]
     readonly property int noiseIndex: noiseModes.indexOf(noise)
@@ -946,7 +1279,10 @@ PluginComponent {
     //
     // conditionVisible is only consulted when a visibilityCommand is set, so the
     // hide-when-disconnected option goes through the override API instead.
-    readonly property bool wantVisible: !(hideWhenDisconnected && !connected)
+    // Split from wantVisible so the hold logic can be checked without the
+    // hide-when-disconnected setting deciding the answer on its own.
+    readonly property bool moduleShouldShow: connected || disconnectGrace
+    readonly property bool wantVisible: !(hideWhenDisconnected && !moduleShouldShow)
 
     onWantVisibleChanged: setVisibilityOverride(wantVisible)
 
@@ -955,6 +1291,30 @@ PluginComponent {
         repeat: false
         running: true
         onTriggered: root.setVisibilityOverride(root.wantVisible)
+    }
+
+    // ---- panel auto-close --------------------------------------------------
+    //
+    // The popout used to outlive the AirPods: the bar module fell back to the
+    // plain Bluetooth icon and then hid itself, while an open panel went on
+    // showing battery levels and controls for a device that had gone. Close it
+    // once the module itself has given up, which is the same moment the bar
+    // stops holding the disconnect grace open.
+    //
+    // A held link is not a disconnect. Healing the link, the settings
+    // read-back reopen and audio handed to another host each keep `connected`
+    // true, so the panel stays where it is; the explicit term below says so
+    // rather than leaving it to `connected` to keep meaning that.
+    readonly property bool panelHeldOpen: linkReconnecting || verifyReopen || handoffHeldElsewhere
+    readonly property bool panelShouldClose: !panelHeldOpen && !moduleShouldShow
+    readonly property bool panelOpen: !!popoutRef && popoutRef.shouldBeVisible === true
+
+    // Only on the transition into the closed-for-good state, never on the
+    // panel opening: with hide-when-disconnected off the module stays on the
+    // bar, and a panel the user opened then must stay up.
+    onPanelShouldCloseChanged: {
+        if (panelShouldClose && panelOpen)
+            closePopout();
     }
 
     // ---- bar ---------------------------------------------------------------
@@ -1010,7 +1370,9 @@ PluginComponent {
 
     horizontalBarPill: Component {
         Row {
+            objectName: "aurisBarPill"
             spacing: Theme.spacingXS
+            opacity: root.barContentOpacity
 
             PillPodsIcon {
                 anchors.verticalCenter: parent.verticalCenter
@@ -1038,7 +1400,9 @@ PluginComponent {
 
     verticalBarPill: Component {
         Column {
+            objectName: "aurisBarPillVertical"
             spacing: Theme.spacingXS
+            opacity: root.barContentOpacity
 
             PillPodsIcon {
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -1753,6 +2117,158 @@ PluginComponent {
                             }
                         }
                     }
+
+                    // Link healing. One line while the daemon rejoins the
+                    // AirPods, so the pause is explained rather than looking
+                    // like they went away. Older daemons never open it.
+                    Item {
+                        id: linkSlot
+                        objectName: "aurisLinkSlot"
+                        width: parent.width
+                        height: root.linkStatusText.length > 0 ? linkCard.height + Theme.spacingS : 0
+                        visible: height > 0
+                        clip: true
+                        property string shownText: ""
+
+                        // Keeps its last line while the slot collapses, the
+                        // same way the handoff row does.
+                        Binding on shownText {
+                            when: root.linkStatusText.length > 0
+                            value: root.linkStatusText
+                            restoreMode: Binding.RestoreNone
+                        }
+                        Behavior on height {
+                            NumberAnimation {
+                                duration: Theme.shortDuration
+                                easing.type: Theme.standardEasing
+                            }
+                        }
+
+                        StyledRect {
+                            id: linkCard
+                            objectName: "aurisLinkCard"
+                            y: Theme.spacingS
+                            width: parent.width
+                            height: linkRow.height + root.cardPad * 2
+                            radius: Theme.cornerRadius
+                            color: Theme.floatingWindowNestedSurface
+                            border.color: Theme.outlineMedium
+                            border.width: Theme.layerOutlineWidth
+
+                            Row {
+                                id: linkRow
+                                x: root.cardPad
+                                y: root.cardPad
+                                width: parent.width - root.cardPad * 2
+                                height: 24
+                                spacing: Theme.spacingM
+
+                                DankIcon {
+                                    objectName: "aurisLinkIcon"
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "sync"
+                                    size: Theme.iconSizeSmall
+                                    color: Theme.surfaceVariantText
+                                }
+                                StyledText {
+                                    objectName: "aurisLinkText"
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: parent.width - Theme.iconSizeSmall - Theme.spacingM
+                                    text: linkSlot.shownText
+                                    elide: Text.ElideRight
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceText
+                                }
+                            }
+                        }
+                    }
+
+                    // Seamless switching. The slot animates its own height so
+                    // the row eases in instead of shoving the setup chevron,
+                    // and keeps its last text while it collapses.
+                    Item {
+                        id: handoffSlot
+                        objectName: "aurisHandoffSlot"
+                        width: parent.width
+                        height: root.handoffCardVisible ? handoffCard.height + Theme.spacingS : 0
+                        visible: height > 0
+                        clip: true
+                        property string shownText: ""
+                        property string shownIcon: "devices"
+
+                        Binding on shownText {
+                            when: root.handoffCardVisible
+                            value: root.handoffRowText
+                            restoreMode: Binding.RestoreNone
+                        }
+                        Binding on shownIcon {
+                            when: root.handoffCardVisible
+                            value: root.handoffRowIcon
+                            restoreMode: Binding.RestoreNone
+                        }
+                        Behavior on height {
+                            NumberAnimation {
+                                duration: Theme.shortDuration
+                                easing.type: Theme.standardEasing
+                            }
+                        }
+
+                        StyledRect {
+                            id: handoffCard
+                            objectName: "aurisHandoffCard"
+                            y: Theme.spacingS
+                            width: parent.width
+                            height: handoffRow.height + root.cardPad * 2
+                            radius: Theme.cornerRadius
+                            color: Theme.floatingWindowNestedSurface
+                            border.color: Theme.outlineMedium
+                            border.width: Theme.layerOutlineWidth
+
+                            RowLayout {
+                                id: handoffRow
+                                x: root.cardPad
+                                y: root.cardPad
+                                width: parent.width - root.cardPad * 2 - (handoffUseHere.visible ? handoffUseHere.width + Theme.spacingM : 0)
+                                // Fixed so the button coming and going with a
+                                // caption never changes the card's height.
+                                height: 36
+                                spacing: Theme.spacingM
+
+                                DankIcon {
+                                    objectName: "aurisHandoffIcon"
+                                    Layout.alignment: Qt.AlignVCenter
+                                    name: handoffSlot.shownIcon
+                                    size: Theme.iconSizeSmall
+                                    color: Theme.surfaceVariantText
+                                }
+                                StyledText {
+                                    objectName: "aurisHandoffText"
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    Layout.alignment: Qt.AlignVCenter
+                                    text: handoffSlot.shownText
+                                    elide: Text.ElideRight
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceText
+                                }
+                            }
+
+                            // Anchored rather than laid out: DankButton sizes
+                            // itself through width, which a layout cannot read.
+                            DankButton {
+                                id: handoffUseHere
+                                objectName: "aurisHandoffUseHere"
+                                anchors.right: parent.right
+                                anchors.rightMargin: root.cardPad
+                                y: root.cardPad
+                                visible: root.handoffRemotePlaying
+                                enabled: root.daemonUp
+                                text: "Use here"
+                                buttonHeight: 36
+                                onClicked: root.takeOver()
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1849,23 +2365,37 @@ PluginComponent {
                                 }
                             }
                             onLoaded: {
-                                item.available = Qt.binding(() => root.advancedAvailable && !root.advancedReadbackActive);
+                                item.available = Qt.binding(() => root.advancedAvailable);
                                 item.unavailableReason = Qt.binding(() => root.advancedUnavailableReason);
-                                item.pendingRequests = Qt.binding(() => root.pendingAdvanced);
+                                item.pendingRequests = Qt.binding(() => root.advancedRequests);
+                                // Reading an absent property yields undefined
+                                // rather than throwing, so a settings component
+                                // that predates daemon-verified writes still
+                                // loads: it just shows values without captions.
+                                if (item.captions !== undefined)
+                                    item.captions = Qt.binding(() => root.advancedCaptions);
+                                else
+                                    console.info("auris: settings component has no caption lane; showing values only");
                                 item.deviceIdentity = Qt.binding(() => root.dev && typeof root.dev.address === "string" ? root.dev.address : "");
                                 item.deviceName = Qt.binding(() => root.confirmedDeviceName);
-                                item.microphone = Qt.binding(() => root.confirmedSetting("microphone"));
-                                item.pressSpeed = Qt.binding(() => root.confirmedSetting("press_speed"));
-                                item.holdDuration = Qt.binding(() => root.confirmedSetting("hold_duration"));
-                                item.listeningModeCycle = Qt.binding(() => root.confirmedSetting("listening_mode_cycle"));
-                                item.callControls = Qt.binding(() => root.confirmedSetting("call_controls"));
-                                item.personalizedVolume = Qt.binding(() => root.confirmedSetting("personalized_volume"));
+                                item.microphone = Qt.binding(() => root.effectiveSetting("microphone"));
+                                item.pressSpeed = Qt.binding(() => root.effectiveSetting("press_speed"));
+                                item.holdDuration = Qt.binding(() => root.effectiveSetting("hold_duration"));
+                                item.listeningModeCycle = Qt.binding(() => root.effectiveSetting("listening_mode_cycle"));
+                                item.callControls = Qt.binding(() => root.effectiveSetting("call_controls"));
+                                item.personalizedVolume = Qt.binding(() => root.effectiveSetting("personalized_volume"));
+                                if (item.handoff !== undefined)
+                                    item.handoff = Qt.binding(() => root.handoffAvailable ? root.handoff : null);
                                 console.info("auris: device settings loaded", source);
                             }
 
                             Connections {
                                 target: deviceSettings.item
+                                ignoreUnknownSignals: true
 
+                                function onHandoffToggleRequested(on) {
+                                    root.setHandoff(on);
+                                }
                                 function onRenameRequested(name) {
                                     root.requestAdvancedRename(name);
                                 }
