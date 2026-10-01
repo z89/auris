@@ -101,8 +101,8 @@ microphone side and the listening-mode cycle produce no device report. that is
 why they carry ❓.
 
 handoff, rejoin and the audio-route follow were each captured working against
-a Mac. the live timelines were replayed in unit tests. auto-connect is on by
-default, but no successful case-open connect is recorded.
+a Mac. the live timelines were replayed in unit tests. auto-connect on case
+open and the in-ear pause and resume are confirmed working on AirPods 4 (ANC).
 
 hearing aid, Find My, spatial audio, heart rate and high-quality two-way audio
 each need protocol, security or audio-stack work well beyond this plugin. none of

@@ -15,19 +15,19 @@ deliberately out of scope.
 | call controls | value change accepted, confirmed by immediate and startup readback |
 | personalized volume | value change accepted, confirmed by immediate and startup readback |
 | multi-host handoff | yield on another host's claim and the take-over on a local play edge were exercised against a Mac on macOS 26.6.2, and the captured timelines are replayed in `handoff.rs` tests. it is opt-in under `[handoff] enabled` and needs an Apple `DeviceID` in bluez plus one re-pair. keeping both profiles connected on yield is not confirmed against an Apple host, and a yield during a call on the other host is not exercised |
+| rename | the rename is sent, then read back from the accessory's own `0x1D` metadata on a reopened link and reported as `confirmed` or `mismatch`. confirmed working on AirPods 4 (ANC) in daily use. Apple hosts never show the new name, see the blocked row below |
+| in-ear media control | pause and resume of local MPRIS players on in-ear transitions, on by default under `[ear]`, with a 700ms settle delay, a five-minute resume window and an ownership gate. the bud-out pause and bud-in resume are confirmed working on AirPods 4 (ANC) in daily use |
+| auto-connect on case open | on by default under `[autoconnect]`. a qualifying proximity advert starts one bounded connect sequence, and a slow page fallback covers adapters that miss the advert. a case-open connect is confirmed working on AirPods 4 (ANC) in daily use |
 
 ## implemented but unconfirmed by any device report
 
 | feature | status |
 |---|---|
 | settings foundation | typed commands, optional snapshot fields, and the unknown/readback/pending distinction are implemented. state.json is schema 2 and old schema-1 snapshots still deserialize |
-| rename | the rename is sent, then read back from the accessory's own `0x1D` metadata on a reopened link and reported as `confirmed` or `mismatch`. no hardware run of that readback is recorded. Apple hosts never show the new name, see the blocked row below |
 | microphone side selection | automatic/left/right selection is implemented. the accessory sends no confirming report on this firmware, and physical one-bud behavior is unconfirmed |
 | listening-mode cycle | implemented against a validated set of supported modes. the accessory sends no confirming report on this firmware. stem-triggered cycling and changes made by another host are unconfirmed |
 | identity-matched BLE battery telemetry | implemented and opt-in under `[ble]`, off by default. it does not acquire or provision BLE keys automatically. auto-connect is a separate path that matches the proximity advert by model id and needs no keys |
 | guarded one-attempt AAP recovery | implemented. one AAP attempt per local connection, with no automatic AAP redial after an ambiguous loss |
-| in-ear media control | pause and resume of local MPRIS players on in-ear transitions is implemented and on by default under `[ear]`, with a 700ms settle delay, a five-minute resume window and an ownership gate. the physical bud-out and bud-in path is unconfirmed |
-| auto-connect on case open | implemented and on by default under `[autoconnect]`. a qualifying proximity advert starts one bounded connect sequence, and a slow page fallback covers adapters that miss the advert. no successful case-open connect is recorded in the code, tests or changelog |
 | rejoin after eviction, bud switch or link loss | implemented and on by default once handoff is enabled. the eviction rules are replayed in `rejoin.rs` tests from drops captured against a Mac. the `connected` and `link_lost` rules have not fired on hardware on their own |
 | ordered yield | local playback is paused and drained, then the card profile is released, before ownership is handed over, so playback stops instead of moving to another sink. the yield itself is exercised under multi-host handoff above. the drain and release order is auris policy with bounded waits and is not separately confirmed on hardware |
 | per-key requested/report tracking, non-shifting toasts, per-cell battery freshness | implemented in the settings/readback and telemetry layer |
