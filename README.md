@@ -1,7 +1,5 @@
 <h1 align="center">auris</h1>
 
-<p align="center">a native AirPods stack for Linux: the Apple Accessory Protocol, multi-host ownership handoff, in-ear control and verified settings, in one rootless user service</p>
-
 <p align="center">
   <a href="https://github.com/z89/auris/stargazers"><img src="https://img.shields.io/github/stars/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="stars"></a>
   <a href="https://github.com/z89/auris/commits/main"><img src="https://img.shields.io/github/last-commit/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="last commit"></a>
@@ -9,6 +7,8 @@
   <img src="https://img.shields.io/badge/rust-1.85%2B-8fd3ff?style=flat-square&labelColor=1b1a20" alt="rust 1.85+">
   <img src="https://img.shields.io/badge/aap-l2cap%200x1001-8fd3ff?style=flat-square&labelColor=1b1a20" alt="AAP on L2CAP PSM 0x1001">
 </p>
+
+auris brings AirPods features from Apple devices to Linux: battery for each bud and the case, noise control and the other AirPods settings, pausing and resuming playback when a bud leaves or enters an ear, and handing the AirPods back and forth with a Mac, iPhone or iPad. it runs as a rootless user service on stock BlueZ and PipeWire, with a command line tool, a JSON state file and an optional DankMaterialShell panel.
 
 `aurisd` is a Rust daemon that speaks the Apple Accessory Protocol (AAP) to AirPods over the L2CAP control channel on PSM 0x1001, the channel Apple's own hosts use. it completes the Apple handshake, subscribes to the accessory's notifications and decodes them: battery per bud and case, in-ear state, noise-control mode and adaptive level, conversational awareness, device metadata and firmware, and the multi-host ownership and smart-routing messages the AirPods relay between hosts.
 
