@@ -3,7 +3,7 @@
 <p align="center">
   <a href="https://github.com/z89/auris/stargazers"><img src="https://img.shields.io/github/stars/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="stars"></a>
   <a href="https://github.com/z89/auris/commits/main"><img src="https://img.shields.io/github/last-commit/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="last commit"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="license"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8fd3ff?style=flat-square&labelColor=1b1a20" alt="license MIT"></a>
   <img src="https://img.shields.io/badge/rust-1.85%2B-8fd3ff?style=flat-square&labelColor=1b1a20" alt="rust 1.85+">
   <img src="https://img.shields.io/badge/aap-l2cap%200x1001-8fd3ff?style=flat-square&labelColor=1b1a20" alt="AAP on L2CAP PSM 0x1001">
 </p>
