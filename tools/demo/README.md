@@ -1,19 +1,19 @@
 # auris demo capture
 
-`record.py` produces the README demo. it does three things:
+`record.py` produces the README demo. it does three things.
 
-- stages a reproducible DMS bar
+- stages a reproducible DankMaterialShell (DMS) bar
 - records a lossless crop
 - logs the pointer and click timeline for post-processing
 
 while it runs it changes the live bar, wallpaper, theme, AirPods connection and
 AirPods controls. it restores the captured state on exit.
 
-do not run any mode unless you are ready for those visible and Bluetooth changes.
+do not run any mode unless you are ready for those visible and bluetooth changes.
 
 ## pre-record gate
 
-gate before any take:
+every take is gated on the following.
 
 - finish the separately approved daemon/plugin deployment first.
 - finish the hardware checks first.
@@ -21,7 +21,7 @@ gate before any take:
   old coordinates are not acceptance evidence.
 - include one instant setup change and its contextual feedback, then collapse
   setup before the main listening-mode/theme sequence.
-- show real charging/history transitions; synthetic live values are not
+- show real charging/history transitions. synthetic live values are not
   allowed.
 - do not enable BLE discovery or unattended connection automation merely for a
   take. BLE requires provisioned keys and radio validation.
@@ -31,13 +31,13 @@ every calibration, dry run and recording still needs its own desktop approval.
 ## required programs
 
 - `dms`, `auris`, `bluetoothctl`, `ydotool` and a running `ydotoold`
-- `grim` and ImageMagick's `magick` for calibration
+- `grim` and imagemagick's `magick` for calibration
 - `wf-recorder` for the real take
 - `ffmpeg` and `gifski` for composition once `compose.py` is added
 
 ## wallpaper sequence
 
-the take uses five local wallpapers in this order:
+the take uses five local wallpapers in this order.
 
 1. snowy mountains (`9fza8w50wdd91.png`)
 2. cosmic blue/purple (`cosmic_art-wallpaper-5120x1440.jpg`)
@@ -51,7 +51,7 @@ along with one dark-to-light mode change. each operation is written into
 
 ## workflow
 
-from the repository root:
+run these from the repository root.
 
 ```sh
 python3 tools/demo/record.py --calibrate
