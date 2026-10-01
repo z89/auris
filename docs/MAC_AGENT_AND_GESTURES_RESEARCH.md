@@ -6,56 +6,57 @@ from the AirPods 4 sensor stream. it covers hard platform limits, a proposed
 helper architecture, the AirPods features such a helper could and could not
 deliver, and gesture recognition design.
 
-## why Linux renames do not propagate to Apple hosts
+## why linux renames do not propagate to Apple hosts
 
-Linux renames the AirPods over AAP opcode 0x1A and the accessory accepts it.
+linux renames the AirPods over AAP opcode 0x1A and the accessory accepts it.
 every Apple host still shows the old name.
 
 Apple hosts display the name stored in their own pairing record. iCloud
 Keychain syncs that record between Apple devices. an Apple host never
 re-reads the accessory's advertised name after initial pairing.
 
-this means a Linux-side rename cannot make Apple hosts show the new name.
+this means a linux-side rename cannot make Apple hosts show the new name.
 any fix has to run on the Apple side of the sync boundary.
 
 ## hard platform limits
 
 | item | finding | verdict |
 |---|---|---|
-| Secure Enclave keys | class keys and any token-bound key never leave the chip; no software path reads them | physically impossible |
-| iCloud Keychain synchronizable items | not enumerated by `security dump-keychain` at all; Apple's own access groups are entitlement-gated, so third-party code cannot read them even with a user prompt | hard wall |
-| Keychain secret values | `security dump-keychain -d` raises a GUI password prompt; no headless path exists | needs a person at the keyboard, and yields nothing a helper needs |
-| Keychain attribute metadata | `security dump-keychain` without `-d` works over ssh; entries under service `BluetoothGlobal` are the Mac's own Continuity identity roots, none labelled for the AirPods | reachable, but carries no secrets |
-| Bluetooth pairing plist | `/Library/Preferences/com.apple.bluetooth.plist` holds only settings on macOS 26; the legacy device cache plist does not exist on this version. names and link keys live in bluetoothd's iCloud-synced store | not editable |
-| Find My location store | `~/Library/Group Containers/group.com.apple.icloud.searchpartyuseragent/Library/Storage/` holds `OwnedBeacons/*.record`, naming and product records, `BeaconEstimatedLocation/<uuid>/`, `CachedUnifiedBeacons.data`, and `CloudStorage.db`. files are readable over ssh but every record is ciphertext; the decryption keys are iCloud Keychain items | unreadable headlessly |
-| independent Find My fetch (macless-haystack style) | works only for self-generated beacon keys; an Apple-paired accessory uses a per-accessory private beacon key that is the same locked item above | not applicable to a paired accessory |
-| direct Apple ID sign-in from Linux | a login flow is reproducible outside Apple hardware, but the trust circle requires Secure Enclave attestation, so a non-Apple host never receives keychain-synced records even when signed in | possible, but useless for this purpose |
+| Secure Enclave keys | class keys and any token-bound key never leave the chip, and no software path reads them | physically impossible |
+| iCloud Keychain synchronizable items | not enumerated by `security dump-keychain` at all. Apple's own access groups are entitlement-gated, so third-party code cannot read them even with a user prompt | hard wall |
+| Keychain secret values | `security dump-keychain -d` raises a GUI password prompt, and no headless path exists | needs a person at the keyboard, and yields nothing a helper needs |
+| Keychain attribute metadata | `security dump-keychain` without `-d` works over ssh. entries under service `BluetoothGlobal` are the Mac's own Continuity identity roots, none labelled for the AirPods | reachable, but carries no secrets |
+| bluetooth pairing plist | `/Library/Preferences/com.apple.bluetooth.plist` holds only settings on macOS 26. the legacy device cache plist does not exist on this version. names and link keys live in bluetoothd's iCloud-synced store | not editable |
+| Find My location store | `~/Library/Group Containers/group.com.apple.icloud.searchpartyuseragent/Library/Storage/` holds `OwnedBeacons/*.record`, naming and product records, `BeaconEstimatedLocation/<uuid>/`, `CachedUnifiedBeacons.data`, and `CloudStorage.db`. files are readable over ssh but every record is ciphertext, and the decryption keys are iCloud Keychain items | unreadable headlessly |
+| independent Find My fetch (macless-haystack style) | works only for self-generated beacon keys, while an Apple-paired accessory uses a per-accessory private beacon key that is the same locked item above | not applicable to a paired accessory |
+| direct Apple ID sign-in from linux | a login flow is reproducible outside Apple hardware, but the trust circle requires Secure Enclave attestation, so a non-Apple host never receives keychain-synced records even when signed in | possible, but useless for this purpose |
 
-conclusion: no amount of Keychain duplication or Secure Enclave replication
-reaches these items from Linux. the durable route is to let a Mac already
-inside the trust circle perform the operation and report the result back.
+the conclusion is that no amount of Keychain duplication or Secure Enclave
+replication reaches these items from linux. the durable route is to let a
+Mac already inside the trust circle perform the operation and report the
+result back.
 
 ## what a helper in the user's Mac session can reach
 
 ### the ssh session boundary
 
-a process started by ssh is denied Bluetooth by the privacy system
-regardless of user. the responsible binary is `sshd`; the TCC log line reads
-`kTCCServiceBluetoothAlways denied, Policy disallows prompt`. every
-Bluetooth API called from a bare ssh shell returns zero paired devices.
+a process started by ssh is denied bluetooth by the privacy system
+regardless of user. the responsible binary is `sshd`, and the TCC log line
+reads `kTCCServiceBluetoothAlways denied, Policy disallows prompt`. every
+bluetooth API called from a bare ssh shell returns zero paired devices.
 
-a LaunchAgent bootstrapped into the console user's GUI domain does not carry
-this restriction:
+a LaunchAgent bootstrapped into the console user's GUI domain with the
+command below does not carry this restriction.
 
 ```
 launchctl bootstrap gui/501 <plist>
 ```
 
 this needs no root. inside that domain, IOBluetooth sees the real paired
-devices. `launchctl asuser` was evaluated as an alternative; it requires
+devices. `launchctl asuser` was evaluated as an alternative. it requires
 root, which is not available without a password on this machine.
 
-this means any operation that needs Bluetooth or Keychain access must run
+this means any operation that needs bluetooth or Keychain access must run
 inside a GUI-session LaunchAgent, never as a bare ssh command and never as a
 LaunchDaemon (root context, no user Keychain, no iCloud session).
 
@@ -63,14 +64,14 @@ LaunchDaemon (root context, no user Keychain, no iCloud session).
 
 | method | changes the shown name | writes accessory and syncs iCloud | survives macOS updates | prerequisites | result |
 |---|---|---|---|---|---|
-| `blueutil` (Homebrew) | no | no | n/a | brew | no rename verb exists; ruled out |
-| System Settings UI automation via `osascript` and System Events | yes, Apple's own path | yes | low; System Settings is SwiftUI and is re-laid-out across releases | one-time Accessibility grant, unlocked GUI session | reachable (`UI elements enabled` reports true); drives the visible screen |
-| IOBluetooth `setName:` from a Swift helper in the GUI domain | reads succeed; the write does not persist without a Bluetooth grant | route exists (`setName:` and `setDisplayName:` respond) | medium | GUI domain, Bluetooth permission for the helper, a live run loop | calls hang waiting for the XPC reply without the grant and briefly wedge `pairedDevices()`; bluetoothd recovers on its own each time |
-| edit the pairing plist and signal bluetoothd | no | no | n/a | root | dead on macOS 26: no device cache exists in any plist |
-| AAP 0x1A from the Mac's own L2CAP socket | no | accessory only | n/a | raw L2CAP | same invisibility to other Apple hosts as the Linux rename |
+| `blueutil` (homebrew) | no | no | n/a | brew | no rename verb exists, ruled out |
+| System Settings UI automation via `osascript` and System Events | yes, Apple's own path | yes | low, since System Settings is SwiftUI and is re-laid-out across releases | one-time Accessibility grant, unlocked GUI session | reachable (`UI elements enabled` reports true), drives the visible screen |
+| IOBluetooth `setName:` from a Swift helper in the GUI domain | reads succeed, but the write does not persist without a bluetooth grant | route exists (`setName:` and `setDisplayName:` respond) | medium | GUI domain, bluetooth permission for the helper, a live run loop | calls hang waiting for the XPC reply without the grant and briefly wedge `pairedDevices()`, and bluetoothd recovers on its own each time |
+| edit the pairing plist and signal bluetoothd | no | no | n/a | root | dead on macOS 26, since no device cache exists in any plist |
+| AAP 0x1A from the Mac's own L2CAP socket | no | accessory only | n/a | raw L2CAP | same invisibility to other Apple hosts as the linux rename |
 
 nothing renames headlessly today. the programmatic path is `setName:` from a
-signed helper holding a Bluetooth grant; it is unproven with the grant in
+signed helper holding a bluetooth grant. it is unproven with the grant in
 place. the guaranteed path is System Settings automation, which is fragile
 and takes over the visible screen, so it can only be a supervised fallback,
 not a background operation.
@@ -84,49 +85,49 @@ Mac and is not required by any operation below.
 
 - installing and updating the helper as a per-user LaunchAgent under
   `~/Library/LaunchAgents`, which is user-writable. no prompt.
-- granting Bluetooth to the helper under Privacy and Security. this is the
+- granting bluetooth to the helper under Privacy and Security. this is the
   only mandatory keyboard step. the grant persists only if the helper is
-  signed with a stable identity; an ad-hoc build can lose the grant on every
+  signed with a stable identity. an ad-hoc build can lose the grant on every
   rebuild, so signing is part of the design.
-- after the grant: helper status, the Mac's view of the AirPods (name,
-  connected state, battery), and the `setName:` rename once proven. a
-  successful rename syncs to iCloud automatically.
+- after the grant, helper status, the Mac's view of the AirPods (name,
+  connected state, battery), and the `setName:` rename once proven need no
+  further keyboard step. a successful rename syncs to iCloud automatically.
 
 ### conditions on every operation, regardless of permissions
 
-- the Mac must be awake and on the network; requests queue otherwise.
+- the Mac must be awake and on the network. requests queue otherwise.
 - a rename needs the AirPods connected to the Mac at that moment. auris can
   release the link briefly and reclaim it, which keeps this automatic
   rather than manual.
 
 ### requires a person every time, or is unavailable
 
-- System Settings automation: no prompt per run after the Accessibility
-  grant, but it drives the visible screen, fails on a locked screen, and
-  breaks when the layout changes across releases.
-- Find My location: requires a Keychain unlock per read, and Apple's access
-  group is unreadable even after unlock. treat as unavailable; the Find My
-  app is the only route.
-- any Keychain secret export: a password prompt per run, and the result is
-  not usable regardless.
-- spatial-audio personalization and hearing features: these require an
-  iPhone and are out of a Mac helper's reach entirely.
+- System Settings automation needs no prompt per run after the
+  Accessibility grant, but it drives the visible screen, fails on a locked
+  screen, and breaks when the layout changes across releases.
+- Find My location requires a Keychain unlock per read, and Apple's access
+  group is unreadable even after unlock. treat it as unavailable. the Find
+  My app is the only route.
+- any Keychain secret export needs a password prompt per run, and the
+  result is not usable regardless.
+- spatial-audio personalization and hearing features require an iPhone and
+  are out of a Mac helper's reach entirely.
 
 ## proposed helper architecture
 
 ### process model
 
-two components run on the Mac:
+two components run on the Mac.
 
-1. `mac-agent-helper`: a signed Swift binary in an app bundle, launched by
+1. `mac-agent-helper` is a signed Swift binary in an app bundle, launched by
    `~/Library/LaunchAgents/com.auris.mac-agent.plist` with `RunAtLoad` and
    `KeepAlive`. it runs inside the Aqua session, re-spawns after sleep or
    logout, and listens on a unix socket under the user's home directory.
-2. `mac-agent-relay`: a stateless forwarder invoked over ssh. it shuttles
+2. `mac-agent-relay` is a stateless forwarder invoked over ssh. it shuttles
    one JSON request from stdin to the socket and one response back to
    stdout.
 
-ssh remains a dumb pipe; every operation that needs the GUI session lives in
+ssh remains a dumb pipe. every operation that needs the GUI session lives in
 the helper, not in the relay.
 
 ### transport and wire protocol
@@ -188,7 +189,7 @@ newline-delimited JSON, one request to one response. every request carries
 
 a first slice covers the helper bundle, transport, capabilities, and the
 rename operation with verification, gated on a supervised test of the
-Bluetooth-grant path. firmware-update triggering (report-only), an
+bluetooth-grant path. firmware-update triggering (report-only), an
 automatic-switching toggle, and audio sharing are deferred. Find My and
 spatial personalization remain blocked for the platform reasons in
 sections 2 and 6.
@@ -196,8 +197,8 @@ sections 2 and 6.
 ### related prior art
 
 LibrePods, OpenPods, AirStatus, and MagicPods speak AAP to the accessory
-directly; none of them drives a companion Mac. using the user's own Mac, in
-session, as an authenticated execution surface for operations Linux cannot
+directly. none of them drives a companion Mac. using the user's own Mac, in
+session, as an authenticated execution surface for operations linux cannot
 structurally reach is a different approach from all four.
 
 ## features a Mac helper cannot reach regardless
@@ -205,13 +206,13 @@ structurally reach is a different approach from all four.
 - hearing test, hearing aid mode, and hearing protection are AirPods Pro 2
   features. AirPods 4 lack the hardware for them on any host.
 - personalized spatial audio is a host-side rendering profile produced by an
-  iPhone ear scan. Linux has no Apple spatializer, so the profile has no use
-  there; a scan improves only the Mac's own playback.
+  iPhone ear scan. linux has no Apple spatializer, so the profile has no use
+  there. a scan improves only the Mac's own playback.
 - an iPhone cannot act as a proxy. there is no ssh, no background helper
   process, and no Shortcuts action for AirPods settings on iOS without a
   jailbreak, which is not a dependency this project carries.
 
-## spatial audio on Linux
+## spatial audio on linux
 
 spatial audio is rendered by the host. the AirPods contribute only the
 motion stream from the primary bud's inertial sensor.
@@ -219,16 +220,17 @@ motion stream from the primary bud's inertial sensor.
 on Apple hosts, AirPods 4 receive spatialized stereo, Dolby Atmos playback,
 head tracking anchored to the screen, a personalized profile, and positioned
 voices on calls. LibrePods marks head-tracked spatial audio as unimplemented
-on both Android and Linux; no third party has shipped it.
+on both Android and linux. no third party has shipped it.
 
-a Linux implementation would read the motion stream over AAP (opcode 0x17
-traffic; see PROTOCOL_EVIDENCE.md), run a binaural convolver in PipeWire
+a linux implementation would read the motion stream over AAP (opcode 0x17
+traffic, see PROTOCOL_EVIDENCE.md), run a binaural convolver in pipewire
 with an open HRTF set, and rotate the field using the head data. that yields
-head-tracked spatialized stereo for any Linux application, but there is no
-Atmos content path and no personalized profile; the closest substitute is
-picking the best-fitting public HRTF through a one-time listening test.
+head-tracked spatialized stereo for any linux application, but there is no
+Atmos content path and no personalized profile. the closest substitute is
+picking the public HRTF with the nearest fit through a one-time listening
+test.
 
-the latency budget is the hard constraint: head data must reach the
+the latency budget is the hard constraint, because head data must reach the
 renderer within a few tens of milliseconds or the field visibly lags the
 head. no machine learning is involved anywhere in this pipeline.
 
@@ -236,10 +238,10 @@ head. no machine learning is involved anywhere in this pipeline.
 
 ### where recognition happens
 
-the AirPods themselves do not recognize gestures; the host does. Apple's
+the AirPods themselves do not recognize gestures. the host does. Apple's
 nod-to-answer is a classifier running on the iPhone. LibrePods implements
 its own nod and shake detector on Android from the same motion stream.
-AirPods 4 ANC have no touch surface; the stem force sensor is the only
+AirPods 4 ANC have no touch surface. the stem force sensor is the only
 physical input, so there is no tap area and no swipe gesture available.
 
 ### what the stream gives
@@ -252,36 +254,38 @@ battery, so it should run only while a gesture feature is active.
 
 ### gesture tiers
 
-- reliable: nod, shake, tilt left or right, look up and hold, look down and
-  hold, double nod, double shake.
-- plausible: a slow head swipe for track change, tilt-and-hold as a volume
-  ramp, turn direction to choose between two targets, and chords such as a
-  stem press followed by a nod.
-- record-your-own: the user performs a motion five to ten times, and live
-  motion is matched against the stored traces.
-- not realistic: subtle motions, absolute pointing, and anything that must
-  survive walking, chewing, or talking without a confirmation step.
-- experimental: the original AirPods detected a double-tap purely from the
-  accelerometer, so a firm double-tap on the AirPods 4 housing could be
-  recognized as an impulse pair in the same stream. a single tap is
-  indistinguishable from a bud being adjusted by hand.
+- the reliable tier covers nod, shake, tilt left or right, look up and
+  hold, look down and hold, double nod, and double shake.
+- the plausible tier covers a slow head swipe for track change,
+  tilt-and-hold as a volume ramp, turn direction to choose between two
+  targets, and chords such as a stem press followed by a nod.
+- the record-your-own tier has the user perform a motion five to ten
+  times, and live motion is matched against the stored traces.
+- the not-realistic tier covers subtle motions, absolute pointing, and
+  anything that must survive walking, chewing, or talking without a
+  confirmation step.
+- the experimental tier rests on the original AirPods detecting a
+  double-tap purely from the accelerometer, so a firm double-tap on the
+  AirPods 4 housing could be recognized as an impulse pair in the same
+  stream. a single tap is indistinguishable from a bud being adjusted by
+  hand.
 
 ### stem presses as the more direct path
 
 the firmware sends single, double, and triple presses as standard media
-commands, and Linux can already intercept and remap them. press-and-hold is
+commands, and linux can already intercept and remap them. press-and-hold is
 already configurable over AAP, making the stem the more direct gesture
 surface compared to motion detection.
 
 ### classifier choice
 
-- rule-based detectors cover the fixed gesture set: angular velocity over a
-  threshold on one axis, a sign reversal inside a window, and a repetition
-  count, tunable per user with a few sliders. no training data is needed
-  and the logic stays explainable.
+- rule-based detectors cover the fixed gesture set with angular velocity
+  over a threshold on one axis, a sign reversal inside a window, and a
+  repetition count, tunable per user with a few sliders. no training data
+  is needed and the logic stays explainable.
 - template matching with dynamic time warping covers recorded gestures,
   using nearest-neighbour comparison against the user's own samples. this
-  costs microseconds and needs no training step; a neural network would
+  costs microseconds and needs no training step. a neural network would
   need hundreds of samples per gesture per person and would not outperform
   it at this scale.
 - a small learned gate for false-positive rejection is the one place a
