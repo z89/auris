@@ -389,6 +389,33 @@ pub struct Link {
     pub since: Option<String>,
 }
 
+/// Whether the proximity scan behind case-open auto-connect can run.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanHealth {
+    /// Not scanning, and the last attempt found nothing wrong: the feature is
+    /// off, the AirPods are connected, or the trigger is disarmed.
+    #[default]
+    Idle,
+    /// LE discovery is running and adverts can be seen.
+    Scanning,
+    /// BlueZ runs the adapter without LE (`ControllerMode = bredr`), so no
+    /// advert can be seen. Only the page fallback can connect.
+    LeDisabled,
+    /// No adapter, or the adapter is powered off.
+    AdapterOff,
+    /// Scan setup failed for another reason and is being retried.
+    Failed,
+}
+
+/// Case-open auto-connect health. Always present in state.json.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct Autoconnect {
+    /// State of the proximity scan.
+    pub scan: ScanHealth,
+}
+
 /// The whole state.json document.
 ///
 /// `Eq` is deliberately absent: `settings_requested` holds arbitrary JSON.
@@ -447,6 +474,10 @@ pub struct Snapshot {
     /// snapshots, where it reads as `disconnected`.
     #[serde(default)]
     pub link: Link,
+    /// Case-open auto-connect health. Missing in older snapshots, where it
+    /// reads as `idle`.
+    #[serde(default)]
+    pub autoconnect: Autoconnect,
 }
 
 impl Default for Snapshot {
@@ -474,6 +505,7 @@ impl Default for Snapshot {
             verify_reopen: false,
             handoff: Handoff::default(),
             link: Link::default(),
+            autoconnect: Autoconnect::default(),
         }
     }
 }
@@ -605,6 +637,9 @@ impl Snapshot {
                 attempt: 0,
                 since: None,
             },
+            autoconnect: Autoconnect {
+                scan: ScanHealth::Idle,
+            },
         }
     }
 }
@@ -626,6 +661,7 @@ mod tests {
             keys,
             [
                 "adaptive_level",
+                "autoconnect",
                 "battery",
                 "conversational_awareness",
                 "daemon",
@@ -947,5 +983,19 @@ mod link_contract_tests {
         let snap: Snapshot = serde_json::from_value(json).unwrap();
         assert_eq!(snap.link, Link::default());
         assert_eq!(snap.link.status, LinkStatus::Disconnected);
+    }
+
+    #[test]
+    fn scan_health_uses_snake_case_and_defaults_to_idle() {
+        let mut snap = Snapshot::example();
+        snap.autoconnect.scan = ScanHealth::LeDisabled;
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["autoconnect"]["scan"], "le_disabled");
+
+        // A snapshot written before the field existed.
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("autoconnect");
+        let snap: Snapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(snap.autoconnect.scan, ScanHealth::Idle);
     }
 }

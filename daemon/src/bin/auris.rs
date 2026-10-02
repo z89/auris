@@ -15,7 +15,7 @@ use aurisd::{
     config,
     ctl_proto::{Request, Response},
     settings::{self, SettingCommand},
-    state::{Cell, NoiseControl, NoiseControlMode, Snapshot, Source},
+    state::{Cell, NoiseControl, NoiseControlMode, ScanHealth, Snapshot, Source},
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -563,7 +563,23 @@ fn summary(s: &Snapshot) -> String {
         }
         out.push('\n');
     }
+    if let Some(line) = scan_fault_line(s.autoconnect.scan) {
+        out.push_str(line);
+    }
     out
+}
+
+/// The status line for a proximity scan that cannot run, so a silent
+/// case-open trigger has a visible reason. Nothing while the scan is healthy.
+fn scan_fault_line(scan: ScanHealth) -> Option<&'static str> {
+    match scan {
+        ScanHealth::LeDisabled => Some(
+            "auto-connect: case-open trigger unavailable (Bluetooth LE is off on the adapter)\n",
+        ),
+        ScanHealth::AdapterOff => Some("auto-connect: waiting for a powered Bluetooth adapter\n"),
+        ScanHealth::Failed => Some("auto-connect: proximity scan failing, retrying\n"),
+        ScanHealth::Idle | ScanHealth::Scanning => None,
+    }
 }
 
 /// The contract spelling of a serde enum value, for display.
@@ -866,5 +882,26 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"cmd":"set_setting","key":"microphone","value":"right"}"#
         );
+    }
+
+    #[test]
+    fn status_names_a_scan_fault_and_stays_quiet_otherwise() {
+        let mut snapshot = Snapshot::example();
+        assert!(!summary(&snapshot).contains("auto-connect:"));
+        snapshot.autoconnect.scan = ScanHealth::Scanning;
+        assert!(!summary(&snapshot).contains("auto-connect:"));
+
+        snapshot.autoconnect.scan = ScanHealth::LeDisabled;
+        let text = summary(&snapshot);
+        assert!(
+            text.ends_with(
+                "auto-connect: case-open trigger unavailable (Bluetooth LE is off on the adapter)\n"
+            ),
+            "{text}"
+        );
+        snapshot.autoconnect.scan = ScanHealth::AdapterOff;
+        assert!(summary(&snapshot).contains("waiting for a powered Bluetooth adapter"));
+        snapshot.autoconnect.scan = ScanHealth::Failed;
+        assert!(summary(&snapshot).contains("proximity scan failing"));
     }
 }

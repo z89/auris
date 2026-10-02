@@ -21,9 +21,9 @@ use crate::{
     models,
     settings::{DeviceSettings, SettingCommand},
     state::{
-        Cell, EarState, Link, LinkReason, LinkStatus, NoiseControl, NoiseControlMode, Snapshot,
-        Source, NAME_KEY, STATUS_CONFIRMED, STATUS_MISMATCH, STATUS_UNREPORTED, STATUS_UNVERIFIED,
-        STATUS_VERIFYING, VERIFY_IDLE, VERIFY_REOPENING, VERIFY_SCHEDULED,
+        Cell, EarState, Link, LinkReason, LinkStatus, NoiseControl, NoiseControlMode, ScanHealth,
+        Snapshot, Source, NAME_KEY, STATUS_CONFIRMED, STATUS_MISMATCH, STATUS_UNREPORTED,
+        STATUS_UNVERIFIED, STATUS_VERIFYING, VERIFY_IDLE, VERIFY_REOPENING, VERIFY_SCHEDULED,
     },
 };
 
@@ -95,6 +95,8 @@ pub enum Update {
     /// `device.connected`, which the store already holds, so the two can
     /// arrive in either order.
     Link(Option<LinkActivity>),
+    /// What the proximity scanner last found when it tried to scan.
+    ScanHealth(ScanHealth),
 }
 
 /// A reconnect sequence in flight, as the session sees it. Internal to the
@@ -604,6 +606,7 @@ fn mutate(s: &mut Snapshot, update: Update, primary_bud: PrimaryBud, aux: &mut A
         Update::VerifyFailed => abandon_verification(s),
         Update::Handoff(handoff) => s.handoff = handoff,
         Update::Link(activity) => aux.link = activity,
+        Update::ScanHealth(health) => s.autoconnect.scan = health,
     }
     s.link = resolve_link(s.device.connected, aux.link.as_ref());
     s.battery.stale = ![&s.battery.left, &s.battery.right, &s.battery.case]
@@ -1415,5 +1418,21 @@ mod link_tests {
         assert_eq!(link.status, LinkStatus::Reconnecting);
         assert_eq!(link.reason, Some(LinkReason::AutoConnect));
         assert_eq!(link.attempt, 2);
+    }
+
+    #[test]
+    fn scan_health_is_published_and_only_notifies_on_a_change() {
+        let store = Store::new(Snapshot::default(), PrimaryBud::Auto);
+        let mut rx = store.subscribe();
+        assert_eq!(store.snapshot().autoconnect.scan, ScanHealth::Idle);
+
+        store.apply(Update::ScanHealth(ScanHealth::LeDisabled));
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        assert_eq!(store.snapshot().autoconnect.scan, ScanHealth::LeDisabled);
+
+        // The scanner re-reports the same fault on every recheck.
+        store.apply(Update::ScanHealth(ScanHealth::LeDisabled));
+        assert!(!rx.has_changed().unwrap());
     }
 }
