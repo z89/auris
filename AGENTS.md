@@ -37,7 +37,4 @@ before committing a doc, `grep -nP '—|–| -- |;' <file>` should print nothing
 - LibrePods links point to `librepods-org/librepods`, and quoted LibrePods text keeps its original punctuation.
 - research docs state findings as "the conclusion is that", never `conclusion:`.
 - the feature matrix legend is lowercase, and badges are rust and aap-l2cap, then the license, all in `8fd3ff`.
-
-## 🚧 uncommitted work as of 2026-10-01
-
-- `AurisWidget.qml` changes the socket redial so it keys on `root.socketStreaming` and drops a stale connection before redialing, which covers a daemon restart that rebinds the socket. it is not part of the docs work. test it against a daemon restart, then commit it on its own.
+- `AurisWidget.qml` dials the aurisd socket with a new `Socket` for every attempt. a quickshell 0.3.1 `Socket` never connects again after one failed attempt, so toggling `connected` on a single object loses the stream at the first daemon restart. keep the per-dial object.

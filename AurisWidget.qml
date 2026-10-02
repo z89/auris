@@ -336,45 +336,68 @@ PluginComponent {
     // The daemon pushes a snapshot down its control socket on every change, so
     // the bar appears and disappears in step with the buds instead of up to a
     // poll interval later. One line of JSON per snapshot, same shape as the file.
-    Socket {
-        id: stateSocket
+    //
+    // Every dial uses a new Socket. A quickshell Socket whose connect attempt
+    // failed keeps its dead connection object and ignores every later request
+    // to connect, and a daemon restart always produces such an attempt: the
+    // old stream closes, the redial lands while the socket path is gone, and
+    // the stream would stay down for the rest of the session.
+    readonly property string socketPath: runtimeDir ? runtimeDir + "/aurisd/ctl.sock" : ""
+    property var stateSocket: null
 
-        path: root.runtimeDir ? root.runtimeDir + "/aurisd/ctl.sock" : ""
-        parser: SplitParser {
-            splitMarker: "\n"
-            onRead: line => {
-                if (root.parseState(line))
-                    root.socketStreaming = true;
+    Component {
+        id: stateSocketComponent
+
+        Socket {
+            id: dialedSocket
+
+            path: root.socketPath
+            connected: true
+            parser: SplitParser {
+                splitMarker: "\n"
+                onRead: line => {
+                    if (root.parseState(line))
+                        root.socketStreaming = true;
+                }
             }
-        }
-        onConnectionStateChanged: {
-            if (connected) {
-                write('{"cmd":"subscribe"}\n');
-                flush();
-            } else {
-                root.socketStreaming = false;
-                root.daemonUp = false;
-                root.cancelAdvancedPending("Request cancelled because aurisd became unavailable.");
+            onConnectionStateChanged: {
+                if (connected) {
+                    write('{"cmd":"subscribe"}\n');
+                    flush();
+                } else if (root.stateSocket === dialedSocket) {
+                    // Only the socket in use speaks for the stream. One that
+                    // was replaced closes too, on its way out.
+                    root.socketStreaming = false;
+                    root.daemonUp = false;
+                    root.cancelAdvancedPending("Request cancelled because aurisd became unavailable.");
+                }
             }
         }
     }
 
-    // Dial the socket, and keep dialing while it is down so a daemon restart is
-    // picked up. triggeredOnStart makes the first attempt immediate; `running`
-    // goes false the moment the stream is up, so nothing ticks in the steady state.
+    function redialStateSocket() {
+        const replaced = stateSocket;
+        stateSocket = stateSocketComponent.createObject(root);
+        if (replaced)
+            replaced.destroy();
+    }
+
+    // Dial the socket, and keep dialing until snapshots are actually arriving.
+    // triggeredOnStart makes the first attempt immediate, and `running` goes
+    // false the moment snapshots flow, so nothing ticks in the steady state.
     Timer {
         interval: 2000
         repeat: true
         triggeredOnStart: true
-        running: stateSocket.path !== "" && !stateSocket.connected
-        onTriggered: stateSocket.connected = true
+        running: root.socketPath !== "" && !root.socketStreaming
+        onTriggered: root.redialStateSocket()
     }
 
     // Fallback only. The daemon replaces state.json with an atomic rename, which
     // the file watcher does not always follow, so poll while the push stream is
     // down. The file is under 1 KiB.
     Timer {
-        interval: 3000
+        interval: 1000
         repeat: true
         running: root.statePath !== "" && !root.socketStreaming
         onTriggered: stateFile.reload()
