@@ -195,6 +195,8 @@ if handoff does nothing, confirm the `DeviceID` line is in `/etc/bluetooth/main.
 
 if the AirPods do not connect when the case opens, run `auris status`. a last line saying bluetooth LE is off on the adapter means bluez runs with `ControllerMode = bredr` in `/etc/bluetooth/main.conf`, so the advert scan cannot start. set `ControllerMode = dual` (or remove the line) and run `sudo systemctl restart bluetooth`. aurisd notices the adapter coming back and starts the scan without a restart of its own. while LE is off, only the page fallback connects, and only in the first 10min after a drop.
 
+on one adapter (a MediaTek MT7925 with bluez 5.87) pairing the AirPods hung in the default dual mode and completed with `ControllerMode = bredr`. set `bredr` only while pairing, then set it back to `dual` and restart bluetooth so case-open auto-connect works again. on that card dual mode connects normally once the AirPods are paired, and the advert trigger was checked there.
+
 ## 🏗️ architecture
 
 <p align="center"><img src="docs/img/architecture.svg" alt="architecture" width="820"></p>
