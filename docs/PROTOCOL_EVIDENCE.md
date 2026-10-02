@@ -1,259 +1,200 @@
 # protocol evidence and verification for advanced settings
 
-protocol observations for AirPods 4 ANC (model id `201B`) speaking AAP over
-L2CAP PSM `0x1001`. these are protocol observations, not captured fixtures
-shipped with the repository. the implementation in auris is written
-independently against them.
+observations for AirPods 4 ANC (model id `201B`) speaking AAP over L2CAP PSM
+`0x1001`. they are not fixtures shipped with the repository, and auris is
+written independently against them. battery, in-ear state, BLE, identity
+matching, radio limits and handoff opcodes are in
+[battery observation and handoff safety](BATTERY_AND_HANDOFF.md).
 
 ## message classes and opcodes
 
 | opcode | meaning | notes |
 |---|---|---|
-| `0x08` | connection info | re-emitted after a settings write, carries no setting payload |
-| `0x09` | accessory control report / write | carries a control identifier plus payload bytes (see the settings table below) |
-| `0x0C` | bud address report | reports the left/right bud's bluetooth address and changes on a primary-role switch |
-| `0x0D` | noise mode (listening mode) | the only control identifier that reliably echoes on change |
-| `0x0E` | connection info | re-emitted after a settings write, carries no setting payload |
-| `0x1A` (top-level) | rename | distinct from control identifier `0x1A` (listening-mode cycle) carried inside opcode `0x09` |
-| `0x1D` | device metadata | carries the accessory's own name, the basis for verifying a rename |
-| `0x2e` | connected-device information | not decoded as a settings report |
+| `0x08` | connection info | re-emitted after a settings write, no setting payload |
+| `0x09` | control report or write | control identifier plus payload (table below) |
+| `0x0C` | bud address report | changes on a primary role switch |
+| `0x0D` | noise mode | echoes on change. of the settings below only call controls (`24`) also echoes |
+| `0x0E` | audio source | which host is sending audio to the AirPods. 6-byte host address (byte-reversed), then `00` none, `01` call or `02` media. also re-emitted after a settings write, with no setting payload |
+| `0x1A` (top level) | rename | unrelated to control `0x1A` inside `0x09` |
+| `0x1D` | device metadata | the accessory's own name, used to verify a rename |
+| `0x2e` | connected devices | not a settings report |
 
-control identifier `0x17` (press speed) is carried inside opcode `0x09`.
-a separate, unrelated top-level opcode `0x17` carries sensor and
-head-tracking traffic in LibrePods. it is not a settings list. the two must
-not be conflated when reading a capture.
+the `0x0E` and `0x2e` layouts are in
+[Apple multi-host switching](BATTERY_AND_HANDOFF.md#apple-multi-host-switching).
+control `0x17` (press speed) travels inside `0x09`. top-level opcode `0x17`
+carries sensor and head-tracking traffic in LibrePods and is not a settings
+list.
 
 ## handshake, subscription and the settings dump
 
 the accessory dumps its settings as `0x09` packets exactly once per L2CAP
-link, about 13ms after the set-features acknowledgement. re-sending
-request-notifications (five-byte or four-byte form), set-features (`0xd7` or
-`0xff`), or the full handshake triple mid-link does not produce a second
-dump. reopening the AAP L2CAP link does. a press-speed write followed by
-`auris reconnect` shows the new value in the fresh dump every time.
+link, about 13ms after the set-features ack. re-sending request-notifications
+(five-byte or four-byte form), set-features (`0xd7` or `0xff`) or the whole
+handshake triple mid-link gives no second dump. reopening the AAP link does,
+and a press-speed write followed by `auris reconnect` shows the new value
+every time. set-features `0xff` (`FeaturesVariant::Ff`, `AURISD_FEATURES=ff`)
+dumps the same as the default `0xd7` and stays opt-in.
 
-the `0xff` set-features byte (`FeaturesVariant::Ff`, `AURISD_FEATURES=ff`)
-produces a dump identical to the default `0xd7`. it remains an opt-in
-variant and is not the default.
-
-the identifiers reported at link open are `0x17`, `0x18`, `0x24`, `0x26`,
-plus the unmodelled `0x1F` (chime volume), `0x1B`, `0x35` and `0x3E`.
-microphone (`0x01`) and listening-mode cycle (`0x1A`) are never reported by
-this model at link open, after a write, or with either features byte. this
-establishes only missing readback for those two identifiers, not rejection
-or unsupported hardware. a separately captured device trace against
-different firmware would be needed to rule out unusual framing.
-
-battery reports, in-ear sensor state, BLE layout, cryptographic identity
-matching, radio limits and hardware gates are documented in
-[battery observation and handoff safety](BATTERY_AND_HANDOFF.md).
+reported at link open are `0x17`, `0x18`, `0x24`, `0x26` and the unmodelled
+`0x1F` (chime volume), `0x1B`, `0x35` and `0x3E`. microphone (`0x01`) and
+listening-mode cycle (`0x1A`) are never reported, at link open, after a
+write, or with either features byte. that proves missing readback only, not
+rejection or missing hardware. a trace from other firmware is needed to rule
+out unusual framing.
 
 ## noise control and listening modes
 
-listening-mode cycle uses control identifier `0x1A`, with off `01`, ANC `02`,
-transparency `04`, adaptive `08`, and bitmask combinations of those values.
-Apple documents selecting multiple stem-cycle listening modes. LibrePods
-blocks removing a mode when fewer than two would remain, and auris keeps the
-same two-mode write minimum. the apply button for this control is removed
-from the UI because there is no confirming echo (see above). an incoming
-cycle mask with only one valid mode is still retained on read, since command
-validation and report decoding are separate rules.
+the cycle mask is off `01`, ANC `02`, transparency `04`, adaptive `08`, or a
+combination. Apple documents multiple stem-cycle modes. LibrePods refuses to
+leave fewer than two, and auris keeps that two-mode write minimum. the UI has
+no apply button for the cycle because nothing echoes it. a one-mode mask is
+still kept on read, since write validation and report decoding are separate.
 
-noise mode (control identifier `0x0D`) is the only setting that echoes
-immediately on change. conversational awareness state is sent once after
-subscribe, not on every change.
-
-off permission (`0x34`) and hold-duration timing semantics still need
-device verification before auris relies on them. auris does not silently
-change the separate off permission to make a cycle work.
-
-the references are [Apple stem controls](https://support.apple.com/en-au/108764)
-and [LibrePods cycle UI](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/presentation/viewmodel/AirPodsViewModel.kt).
+noise mode (`0x0D`) echoes immediately. conversational awareness is sent once
+after subscribe, not on every change. off permission (`0x34`) and
+hold-duration timing need device verification before auris relies on them,
+and auris never changes the off permission to make a cycle work.
 
 ## settings writes, readback and the verification contract
 
-control writes use `04 00 04 00 09 00 ID D1 D2 D3 D4`. unused bytes are
-zero. accessory control reports use opcode `0x09` with the same identifier.
-decoding the report requires the full payload, since the call-control
-mapping cannot be resolved from the first value byte alone.
+writes are `04 00 04 00 09 00 ID D1 D2 D3 D4`, unused bytes zero. reports
+are `0x09` with the same identifier and are decoded from the full payload,
+because call controls cannot be resolved from the first byte.
 
-| setting | identifier | values / payload | what auris cannot yet confirm |
+| setting | id | values | not yet confirmed |
 |---|---|---|---|
-| microphone | `01` | auto `00`, right `01`, left `02` | never echoed, and confirming the selected bud requires an active call session |
-| press speed | `17` | default `00`, slower `01`, slowest `02` | echoed and verified by link reopen, but gesture timing at each setting is unverified |
-| hold duration | `18` | default `00`, shorter `01`, shortest `02` | echoed and verified by link reopen, but the actual hold threshold and its persistence are unverified |
-| listening-mode cycle | `1A` | off `01`, ANC `02`, transparency `04`, adaptive `08`, combined bitmask | never echoed, and unsupported-mode handling and stem behaviour are unverified |
-| call controls | `24` | hang up once/mute twice `00 02`, mute once/hang up twice `00 03` | echoed both ways, but does not remap the initial answer-call press, which is unverified against a live call |
-| personalised volume | `26` | on `01`, off `02` | echoed both ways, but the audible effect is unverified and must not be conflated with host call-audio volume ducking |
+| microphone | `01` | auto `00`, right `01`, left `02` | never echoed, the bud needs a live call to confirm |
+| press speed | `17` | default `00`, slower `01`, slowest `02` | not echoed, the report arrives only on reopen (checked 2026-10-04), gesture timing unverified |
+| hold duration | `18` | default `00`, shorter `01`, shortest `02` | not echoed, the report arrives only on reopen (checked 2026-10-04), threshold and persistence unverified |
+| listening-mode cycle | `1A` | bitmask above | never echoed, unsupported modes and stem behaviour unverified |
+| call controls | `24` | hang up once/mute twice `00 02`, mute once/hang up twice `00 03` | echoed both ways (checked 2026-10-04), answer press not remapped, unverified on a live call |
+| personalised volume | `26` | on `01`, off `02` | not echoed either way, the report arrives only on reopen (checked 2026-10-04), audible effect unverified, not host call-audio ducking |
 
-an example capture of a press-speed write with no corresponding control
-report follows.
+press-speed writes that produced no control report.
 
 ```
 04 00 04 00 09 00 17 01 00 00 00   (slower)
 04 00 04 00 09 00 17 00 00 00 00   (default)
 ```
 
-the report counter after the write above stayed unchanged. sending the
-existing notification request after a write does not make press speed
-report immediately. reopening only the AAP control link does, returning the
-new value with a newer per-link counter. the same reopen sequence verifies
-hold duration and personalised volume. call controls report both their
-changed and restored values immediately, with no link reopen needed. no
-bluetooth connection or audio service is restarted for any of this.
+the report counter did not move, and a new notification request did not
+help. reopening only the AAP link returned the new value with a newer
+per-link counter, and does the same for hold duration and personalised
+volume. call controls report changed and restored values immediately. a repeat
+run on 2026-10-04 gave the same result for all four. no bluetooth connection or
+audio service is restarted.
 
 ### verify-by-reopen design
 
-auris treats a settings write as a request plus a readback, never as a
-single fire-and-forget datagram, and never sends an invented read packet or
-a success fallback.
+a write is a request plus a readback. auris never sends an invented read
+packet and never falls back to success.
 
-1. **write.** a successful write records `settings_requested[key]`, sets
+1. **write.** records `settings_requested[key]`, sets
    `settings_status[key] = "verifying"` and `settings_verify = "scheduled"`,
-   and arms a 1500ms debounce. another write restarts the debounce, so a
-   burst of changes costs one reopen.
-2. **reopen.** when the debounce fires, auris publishes
-   `settings_verify = "reopening"` and `verify_reopen = true`, then reopens
-   the AAP link the same way `reconnect` does, by dropping the socket and
-   dialling again. it never asks bluez to reconnect the device, and never dials a
-   device that is not already locally connected. with no link to reopen,
-   every verifying key becomes `"unverified"`.
-3. **compare.** the readback window ends at the first battery packet after
-   the opening sequence, the point where the set-features variant is
-   pinned. if none arrives it ends 2000ms after the subscribe. each
-   verifying key is compared against the value reported on that link, using
-   a per-link report counter rather than the lifetime `settings_report_seq`.
+   and arms a 1500ms debounce that each new write restarts.
+2. **reopen.** sets `settings_verify = "reopening"` and `verify_reopen = true`,
+   then drops and redials the AAP socket as `reconnect` does. bluez is never
+   asked to reconnect and an unconnected device is never dialled. with no
+   link, every verifying key becomes `"unverified"`.
+3. **compare.** the window ends at the first battery packet after the opening
+   sequence (where the features variant is pinned), or 2000ms after subscribe.
+   values are compared with a per-link counter, not `settings_report_seq`.
 
 | outcome | status |
 |---|---|
 | equal | `"confirmed"` |
-| different | `"mismatch"`, and `settings` holds the device's value |
-| never reported | `"unreported"` (the expected outcome for microphone and cycle) |
-| ten seconds from the write with no verdict | `"unverified"` |
+| different | `"mismatch"`, `settings` holds the device value |
+| never reported | `"unreported"` (expected for microphone and cycle) |
+| no verdict 10s after the write | `"unverified"` |
 
-a link loss that is not the verify reopen keeps `settings_requested` and
-marks verifying keys `"unverified"`. every later link open runs the same
-comparison for keys left `"unverified"` or `"unreported"`, so a natural
-reconnection can still settle an old write.
+any other link loss keeps `settings_requested` and marks verifying keys
+`"unverified"`. every later link open rechecks keys left `"unverified"` or
+`"unreported"`. `connected` and `aap_link` drop briefly during the reopen,
+so the UI stays connected while `verify_reopen` is true. `settings_api = 3`
+adds `name` to `settings_requested` and `settings_status`. CLI output and
+exit codes are in the [daemon reference](../daemon/README.md#cli-reference).
 
-`verify_reopen` exists because `connected` and `aap_link` briefly go false
-during a readback reopen. the UI keeps showing the device as connected
-while it is true.
+### diagnostics
 
-the published contract is `settings_api = 3`. it adds the key `name` to
-`settings_requested` and `settings_status`. a rename is verified from the
-accessory's own `0x1D` metadata on the reopened link, and `device.name`
-carries the name it reported.
+DankMaterialShell (DMS) and daemon logs omit device names and payload values.
+a change is traced by these lines in order, and a datagram-send line alone is
+not confirmation.
 
-`auris setting <key> <json>` subscribes after the write, waits up to ten
-seconds for the status to leave `"verifying"`, then prints one of these lines.
+1. DMS `setting command started` (key, local request number)
+2. daemon `sending AirPods setting`, then `setting datagram sent`
+3. daemon `setting report received`, or a malformed or unmodelled report diagnostic
+4. DMS completion, matching report or confirmation timeout
 
-- `confirmed by AirPods`
-- `AirPods kept <device value>` (exit 1)
-- `applied; AirPods 4 (ANC) never reports this setting back`
-- `sent but not verified: <reason>` (exit 1)
-
-### diagnostics for correlating a setting write across processes
-
-DankMaterialShell and the daemon log deliberately omit device names and setting payload
-values. correlating a setting change end to end means matching these lines in order.
-first the DMS log line `setting command started` (with key and local request
-number), then the daemon lines `sending AirPods setting` and
-`setting datagram sent`, then the daemon line `setting report received` (or a
-malformed/unmodelled report diagnostic), and finally the DMS command
-completion, matching report, or confirmation timeout. a datagram-send
-message alone is not confirmation.
-
-the UI exposes `UI revision` in its technical disclosure and logs
-`auris: UI loaded revision`. a plugin reload response alone does not prove
-a new root revision loaded. the diagnostic `tools/QmlReloadTest.cpp`
-confirms that a new file-URL query loads modified source in the same plain
-qt engine, while an existing instance retains its old revision, but it does
-not prove the live DMS/quickshell reload path works end to end.
+the UI shows `UI revision` and logs `auris: UI loaded revision`. a plugin
+reload response does not prove a new root revision loaded.
+`tools/QmlReloadTest.cpp` shows a new file-URL query loads modified source in
+a plain qt engine while an existing instance keeps its old revision. it does
+not prove the live DMS and quickshell reload path.
 
 ## device metadata and rename
 
-rename uses a different opcode from the settings-write path, namely
-`04 00 04 00 1A 00 01 LL 00 <UTF-8 name>`. it shares the number `1A` with
-the listening-mode cycle control identifier carried inside opcode `0x09`,
-but the two are unrelated. `LL` is the UTF-8 byte count of the name.
+rename is `04 00 04 00 1A 00 01 LL 00 <UTF-8 name>`, `LL` the byte count. the
+name is nonblank, at most 255 bytes, free of control characters, never
+trimmed and never executed. a send or a bluez alias change proves nothing.
+the rename is confirmed only when `0x1D` metadata on the reopened link
+reports it, and `device.name` carries what was reported.
 
-the name must be nonblank, at most 255 bytes, and free of control
-characters. auris does not trim it and does not execute it.
-
-a successful send alone does not update the confirmed device name.
-metadata is unsolicited and may only refresh on a later connection. a
-bluez alias change is not proof of an accessory rename. rename is only
-considered confirmed once the accessory's own `0x1D` metadata reports the
-new name on a reopened link.
-
-more generally, new fields stay unknown until a valid device report
-arrives. a recognised model plus a successfully written packet does not
-establish firmware support for that field. unknown values must not be
-coerced to a default, and must not be mistaken for an explicit off value.
+new fields stay unknown until a valid report arrives. a known model plus a
+written packet does not prove firmware support, and unknown values are never
+coerced to a default or read as off.
 
 ## multi-host ownership and smart routing
 
+ownership, opcodes and rejoin rules are in
+[Apple multi-host switching](BATTERY_AND_HANDOFF.md#apple-multi-host-switching).
+
 ### macOS banner text for a take-over by this host
 
-the banner macOS shows when another host takes the AirPods is rendered by
-`BluetoothUIService`. its strings live on the sealed system volume at
+`BluetoothUIService` renders the banner. its strings are at
 `/System/Library/CoreServices/BluetoothUIService.app/Contents/Resources/Localizable.loctable`
-on an arm64 Mac with SIP enabled.
-
-`audioaccessoryd` maps the `btName` carried in smart-routing media info to
-a model class, and builds the key `MOVED_TO_<CLASS>`.
-
-the keys with an English string are `MOVED_TO_IPHONE`, `MOVED_TO_IPAD`,
-`MOVED_TO_MAC`, `MOVED_TO_WATCH`, `MOVED_TO_APPLETV` and `MOVED_TO_IPOD`.
-
-an unknown name falls back to the iPhone class. `HomePod` is a known class
-without a string, so the raw key `MOVED_TO_HOMEPOD` is displayed as-is. the
-Mac learns the name only when it recreates its entry for this host, which
-happens on link establishment.
+on the sealed system volume (arm64 Mac, SIP enabled). `audioaccessoryd` maps
+the `btName` in smart-routing media info to a class and builds
+`MOVED_TO_<CLASS>`. English strings exist for `MOVED_TO_IPHONE`,
+`MOVED_TO_IPAD`, `MOVED_TO_MAC`, `MOVED_TO_WATCH`, `MOVED_TO_APPLETV` and
+`MOVED_TO_IPOD`. unknown names fall back to iPhone. `HomePod` has no string,
+so the raw key `MOVED_TO_HOMEPOD` shows. the Mac learns the name only when it
+recreates its entry for this host, on link establishment.
 
 ### primary bud role switch drops a non-Apple host
 
-when the bud acting as primary switches, the `0x0C` address report changes
-from the left bud's address to the right bud's (or vice versa) about 30s
-after link-up, coinciding with a bud being taken out. about 3s later the
-AirPods reset the link to this host with `Reason.Remote`. in another
-observed case the same switch instead ended as a supervision timeout.
-
-Apple hosts survive the switch. the address exposed to the host stays the
-same, so the switch is likely meant to be transparent there. the
-disconnection observed here may be specific to the BCM20702A0 dongle's 2012
-firmware rather than to AAP itself. LibrePods has no handover mechanism
-either and reconnects the same way. both outcomes are covered by auris's
-existing rejoin rules, and the link is back in about 6s.
+about 30s after link-up, as a bud is taken out, the `0x0C` report changes to
+the other bud's address. about 3s later the AirPods reset this host's link
+with `Reason.Remote`, and once it ended as a supervision timeout instead.
+Apple hosts survive because their exposed address does not change. the drop
+may be specific to the BCM20702A0 dongle's 2012 firmware. LibrePods has no
+handover either and reconnects the same way. the rejoin rules cover both
+outcomes and the link is back in about 6s.
 
 ## later-feature cautions
 
-- `31` (in-case/charging tones) is not a locating-sound request. Find My
-  case access raises separate reachability and authentication questions.
-- `35` (sleep detection) is described for recent firmware with no
-  published AirPods 4 minimum. no host sleep classifier is justified by
-  this identifier alone.
-- `16` (hold-action configuration) is not a complete incoming stem-event
-  protocol. actual event delivery needs verification before building
-  custom linux actions on top of it.
-- `39` (stem configuration) does not by itself document every gesture
-  event.
-- connection-ownership commands are not proof of ordinary bluetooth
-  multipoint.
-- microphone-side preference does not implement the high-quality AACP
-  microphone transport, and does not solve audio-profile switching.
+- `31` (in-case/charging tones) is not a locating sound. Find My case access
+  raises separate reachability and authentication questions.
+- `35` (sleep detection) targets recent firmware with no published AirPods 4
+  minimum and alone does not justify a sleep classifier.
+- `16` (hold-action configuration) is not a full stem-event protocol. verify
+  event delivery before building linux actions on it.
+- `39` (stem configuration) does not document every gesture event.
+- ownership commands are not ordinary bluetooth multipoint.
+- microphone side does not give the high-quality AACP microphone transport or
+  solve audio-profile switching.
 
-for media automation, use
+media automation follows
 [MPRIS player semantics](https://specifications.freedesktop.org/mpris/latest/Player_Interface.html)
-and explicit playback ownership. for auto-connect, use
+with explicit playback ownership. auto-connect follows
 [bluez Device1 semantics](https://bluez.readthedocs.io/en/latest/device-api/)
-with opt-in, bounded retry and deliberate-disconnect handling. see the
-[roadmap](FEATURE_ROADMAP.md) for acceptance gates and delivery order.
+with opt-in, bounded retry and deliberate-disconnect handling. gates and
+order are in [features](FEATURES.md).
 
 ## primary references
 
-- [control catalog](https://github.com/librepods-org/librepods/blob/53679cc/docs/control_commands.md)
-- [AACP manager](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/bluetooth/AACPManager.kt)
-- [control repository](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/data/ControlCommandRepository.kt)
-- [linux command framing](https://github.com/librepods-org/librepods/blob/53679cc/linux/BasicControlCommand.hpp)
+- [Apple stem controls](https://support.apple.com/en-au/108764)
+- [LibrePods control catalog](https://github.com/librepods-org/librepods/blob/53679cc/docs/control_commands.md)
+- [LibrePods AACP manager](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/bluetooth/AACPManager.kt)
+- [LibrePods control repository](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/data/ControlCommandRepository.kt)
+- [LibrePods linux command framing](https://github.com/librepods-org/librepods/blob/53679cc/linux/BasicControlCommand.hpp)
+- [LibrePods cycle UI](https://github.com/librepods-org/librepods/blob/53679cc/android/app/src/main/java/me/kavishdevar/librepods/presentation/viewmodel/AirPodsViewModel.kt)

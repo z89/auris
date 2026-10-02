@@ -1,12 +1,4 @@
-<h1 align="center">aurisd</h1>
-
-<p align="center">AirPods battery and controls for linux</p>
-
-<p align="center">
-  <a href="https://github.com/z89/auris/stargazers"><img src="https://img.shields.io/github/stars/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="stars"></a>
-  <a href="https://github.com/z89/auris/commits/main"><img src="https://img.shields.io/github/last-commit/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="last commit"></a>
-  <a href="../LICENSE"><img src="https://img.shields.io/github/license/z89/auris?style=flat-square&color=8fd3ff&labelColor=1b1a20" alt="license"></a>
-</p>
+# aurisd
 
 aurisd is a rust daemon that speaks the Apple Accessory Protocol (AAP) over
 the L2CAP control channel on PSM 0x1001. it reports battery per bud and case,
@@ -16,15 +8,12 @@ accessory's own report. it runs as an unprivileged systemd user service, with no
 root and no patched bluez.
 
 this is the `daemon` half of [auris](../README.md). the bar plugin lives one
-directory up.
-
-this file is the reference for the daemon, the `auris` CLI and the config
-file. it covers build and install, then the CLI, then the daemon's own flags, then
-config keys, then the state file and control socket.
+directory up. this file is the reference for the daemon, the `auris` CLI, the
+config file, the state file and the control socket.
 
 ## build and install
 
-with rust 1.85 or newer, run these from this directory.
+needs rust 1.85 or newer. run from this directory.
 
 ```sh
 cargo install --path .
@@ -34,12 +23,12 @@ systemctl --user daemon-reload
 systemctl --user enable --now aurisd
 ```
 
-pair and connect the AirPods as usual. the daemon notices, opens its own link
-next to the audio one, and starts writing.
+pair and connect the AirPods as usual. the daemon opens its own link next to
+the audio one and starts writing state.
 
 ## CLI reference
 
-every `auris` subcommand accepts the global options below.
+global options, accepted by every subcommand.
 
 | option | meaning |
 |---|---|
@@ -47,169 +36,81 @@ every `auris` subcommand accepts the global options below.
 | `-h`, `--help` | print help |
 | `-V`, `--version` | print version (top level only) |
 
-### `auris status [--json]`
-
-shows the current state. `--json` prints the raw `state.json` object instead
-of a summary.
-
-when the advert scan cannot run (`autoconnect.scan` is `le_disabled`,
-`adapter_off` or `failed`), the summary ends with one line saying why.
+| command | arguments | effect |
+|---|---|---|
+| `auris status` | `[--json]` | summary of the current state. `--json` prints the raw `state.json` object |
+| `auris noise` | `anc`, `transparency`, `adaptive` or `off` | set noise control |
+| `auris ca` | `on` or `off` | set conversational awareness |
+| `auris adaptive` | integer 0 to 100 | set the adaptive transparency level |
+| `auris reconnect` | none | drop and redial the AAP link. one guarded attempt, needs an existing local bluetooth connection |
+| `auris connect-once` | none | ask bluez once to connect the pinned paired device. never retries, may take audio from another host |
+| `auris handoff` | `on`, `off` or `status` | switch Apple multi-host switching and persist `[handoff] enabled`, or show its state |
+| `auris take-over` | none | take the AirPods from another Apple host now |
+| `auris yield` | none | give the AirPods to another Apple host now |
+| `auris rename` | `<NAME>` | rename the accessory. quote names with spaces |
+| `auris setting` | `<KEY> <JSON_VALUE>` | write a typed setting (keys below) |
 
 ```sh
-auris status
 auris status --json
-```
-
-### `auris noise <MODE>`
-
-sets the noise control mode. `<MODE>` is one of `anc`, `transparency`,
-`adaptive`, `off`.
-
-```sh
 auris noise anc
-```
-
-### `auris ca <STATE>`
-
-turns conversational awareness on or off. `<STATE>` is `on` or `off`.
-
-```sh
-auris ca on
-```
-
-### `auris adaptive <LEVEL>`
-
-sets the adaptive transparency level. `<LEVEL>` is an integer, 0 to 100.
-
-```sh
-auris adaptive 60
-```
-
-### `auris reconnect`
-
-drops and re-establishes the AAP link. it makes one guarded attempt and requires an
-existing local bluetooth connection.
-
-```sh
-auris reconnect
-```
-
-### `auris connect-once`
-
-asks bluez once to connect the pinned paired device. it never retries
-automatically, and it may transfer audio away from another host.
-
-```sh
-auris connect-once
-```
-
-### `auris handoff <ACTION>`
-
-controls Apple multi-host switching. `<ACTION>` is `on`, `off` or `status`.
-
-```sh
-auris handoff on
-auris handoff status
-```
-
-### `auris take-over`
-
-takes the AirPods over from another Apple host now, acting immediately on an
-open AAP link.
-
-```sh
-auris take-over
-```
-
-### `auris yield`
-
-gives the AirPods up to another Apple host now, acting immediately on an open
-AAP link.
-
-```sh
-auris yield
-```
-
-### `auris rename <NAME>`
-
-renames the AirPods accessory. quote names containing spaces.
-
-```sh
 auris rename 'Desk AirPods'
-```
-
-see [rename](#rename) below for how the write is verified.
-
-### `auris setting <KEY> <JSON_VALUE>`
-
-sets a typed AirPods setting using a JSON value. `<KEY>` is a setting key such
-as `microphone` or `personalized_volume`. `<JSON_VALUE>` is a JSON string,
-boolean, or array appropriate for the key.
-
-```sh
 auris setting microphone '"left"'
 auris setting personalized_volume true
 auris setting listening_mode_cycle '["anc","transparency"]'
 ```
 
-#### setting keys
+- when the advert scan cannot run (`autoconnect.scan` is `le_disabled`,
+  `adapter_off` or `failed`), `auris status` ends with one line saying why.
+- `take-over` and `yield` need an open AAP link and act regardless of
+  `take_over_on_play` or `[handoff] enabled`.
 
-`setting` values are JSON. enum values need quotes. booleans do not. mode
-cycles are arrays.
+### setting keys
+
+values are JSON. enums need quotes, booleans do not, mode cycles are arrays.
 
 | key | JSON value |
 |---|---|
 | `microphone` | `"auto"`, `"left"`, `"right"` |
 | `press_speed` | `"default"`, `"slower"`, `"slowest"` |
 | `hold_duration` | `"default"`, `"shorter"`, `"shortest"` |
-| `listening_mode_cycle` | a non-duplicate array of `"off"`, `"anc"`, `"transparency"`, `"adaptive"` |
+| `listening_mode_cycle` | non-duplicate array of `"off"`, `"anc"`, `"transparency"`, `"adaptive"` |
 | `call_controls` | `"mute_once_hangup_twice"` or `"hangup_once_mute_twice"` |
 | `personalized_volume` | `true` or `false` |
 
-the six typed settings above plus rename are the seven new controls. they are
-currently software-implemented only for product id `201B`, and require an open
-AAP link. the CLI validates them before opening the daemon socket.
+these six plus rename are software-implemented only for product id `201B` and
+need an open AAP link. the CLI validates them before opening the daemon
+socket.
 
-#### what a setting write reports
+### what a setting write or rename reports
 
-`auris setting` does not stop at "sent". it watches the daemon's readback and
-prints one line when the verdict lands, within ten seconds.
+`auris setting` and `auris rename` subscribe after the write, wait up to 10s
+for `settings_status` to leave `verifying`, then print one line. rename is
+tracked under the key `name`. the write went out in every case.
 
-| line | exit | meaning |
-|---|---|---|
-| `confirmed by AirPods` | 0 | a fresh dump reported exactly what was written |
-| `AirPods kept <value>` | 1 | the accessory reported something else. that value is in `settings` |
-| `applied; AirPods 4 (ANC) never reports this setting back` | 0 | the readback ran. this model never reports the key. microphone and listening-mode cycle only |
-| `sent but not verified: <reason>` | 1 | the write went out but no readback could be completed |
+| `settings_status` | meaning | CLI line | exit |
+|---|---|---|---|
+| `verifying` | written, readback running | none yet | |
+| `confirmed` | a fresh dump reported the requested value | `confirmed by AirPods` | 0 |
+| `mismatch` | a fresh dump reported something else, now in `settings` (or `device.name`) | `AirPods kept <value>` | 1 |
+| `unreported` | readback ran, the model never reports the key (microphone and listening-mode cycle on AirPods 4 (ANC)) | `applied; AirPods 4 (ANC) never reports this setting back` | 0 |
+| `unverified` | no readback completed within 10s | `sent but not verified: <reason>` | 1 |
+| absent | `settings_api` below 2, the daemon predates the readback contract | `sent; waiting for AirPods to report the setting` | 0 |
 
-the readback drops and reopens the AAP link once, about a second and a half
-after the last write. it does that because the accessory dumps its settings
-only at link open. `verify_reopen` in `state.json` marks that window.
+the readback reopens the AAP link once, 1500ms after the last write, because
+the accessory dumps its settings only at link open. `verify_reopen` in
+`state.json` marks that window. only reports from the new link count, and no
+write is replayed. the design is in
+[verify by reopen](../docs/PROTOCOL_EVIDENCE.md#verify-by-reopen-design).
 
-#### rename
-
-`auris rename` is verified the same way, under the key `name` in
-`settings_requested` and `settings_status`.
-
-the accessory pushes its own metadata after every AAP handshake. so the
-readback reopen reads the name back from the AirPods themselves. it does not
-wait for bluez, which re-reads the remote name only when a link opens and can
-therefore be many minutes stale.
-
-a reported name that differs from the one written is a `mismatch`.
-`device.name` then holds the name the accessory kept.
-
-the daemon prefers that metadata name over the bluez `Name` or `Alias`. it
-never writes `Alias` itself.
-
-a rename changes the accessory's own name only. Apple hosts keep the name in
-their own pairing record and never re-read it from the accessory. so a rename
-sent from linux shows up on linux and other non-Apple hosts, while an iPhone
-or Mac keeps showing whatever it called the AirPods.
+a rename is read back from the accessory's own metadata, pushed after every
+AAP handshake, not from bluez, which re-reads the remote name only at link
+open and can be minutes stale. a different reported name is a `mismatch`.
+the daemon prefers the metadata name over bluez `Name` or `Alias` and never
+writes `Alias`. Apple hosts keep the name in their own pairing record and
+never re-read it, so a rename shows on linux and other non-Apple hosts while
+an iPhone or Mac keeps its own name.
 
 ### exit codes
-
-these apply to every `auris` subcommand.
 
 | code | meaning |
 |---|---|
@@ -219,7 +120,7 @@ these apply to every `auris` subcommand.
 
 ## daemon flags
 
-`aurisd` itself takes no subcommands, only flags.
+`aurisd` takes flags only.
 
 | flag | meaning |
 |---|---|
@@ -229,156 +130,105 @@ these apply to every `auris` subcommand.
 | `-h`, `--help` | print help |
 | `-V`, `--version` | print version |
 
-### environment variables
-
-these are mostly for poking at things.
-
-- `RUST_LOG=aurisd=debug` for identifiers and lengths it does not model.
-  `trace` for packet framing diagnostics. raw AAP payloads and AAP metadata
-  strings are not logged
-- `AURISD_FEATURES=alt` pins the second set-features variant instead of
-  letting the daemon find one
-- `AURISD_FEATURES=ff` pins the `0xff` selector byte. on AirPods 4 (ANC) it
-  produces the same dump as the default `d7`. it exists for firmware that
-  answers neither of the others
-- `AURISD_RAW_SOCKET=1` uses a plain libc socket instead of bluer's
+| variable | effect |
+|---|---|
+| `RUST_LOG=aurisd=debug` | log identifiers and lengths it does not model. `trace` adds packet framing. raw AAP payloads and metadata strings are never logged |
+| `AURISD_FEATURES=alt` | pin the second set-features variant instead of probing |
+| `AURISD_FEATURES=ff` | pin the `0xff` selector. same dump as the default `d7` on AirPods 4 (ANC), meant for firmware that answers neither |
+| `AURISD_RAW_SOCKET=1` | use a plain libc socket instead of bluer's |
 
 ## config reference
 
-defaults need no configuration. `~/.config/aurisd/config.toml` (or
-`$XDG_CONFIG_HOME/aurisd/config.toml`) can pin identity and opt into extra
-behavior. every key is optional and a missing file is fine. an invalid file
-stops startup rather than being silently ignored.
+`~/.config/aurisd/config.toml` (or `$XDG_CONFIG_HOME/aurisd/config.toml`).
+every key is optional and a missing file is fine. an invalid file stops
+startup. it never silently drops the pinned device and falls back to another
+paired accessory. the example shows every key at its default except `device`.
 
 ```toml
-device = "AC:DE:48:00:11:22"  # pin one address instead of picking the AirPods BlueZ knows about
-primary_bud = "auto"          # which bud the AirPods call primary. "auto", "left" or "right"
+device = "AC:DE:48:00:11:22"
+primary_bud = "auto"
 
 [ble]
-enabled = false              # opt-in only; see the BLE setup/evidence guide
+enabled = false
 # key_file = "/absolute/private/path/keys.json"
 scan_seconds = 8
 interval_seconds = 30
 freshness_seconds = 75
 
 [handoff]
-enabled = false              # Apple multi-host switching; `auris handoff on` sets this
-take_over_on_play = true     # take the AirPods back when a local player starts
-# bt_name = "Mac"            # name announced to other Apple hosts (1-32 bytes)
-rejoin_after_eviction = true # reconnect once after an Apple host's fresh link evicts this host
+enabled = false
+take_over_on_play = true
+# bt_name = "Mac"
+rejoin_after_eviction = true
 
 [ear]
-auto_pause = true            # pause local players when a bud leaves an ear
-auto_resume = true           # resume the player auris paused, once the bud is back in
-pause_on_one_of_two = true   # pause as soon as one of two in-ear buds leaves, not just the last one
+auto_pause = true
+auto_resume = true
+pause_on_one_of_two = true
 
 [autoconnect]
-enabled = true                    # page the AirPods when their BLE proximity advert appears (needs LE on the adapter)
-min_rssi = -90                    # ignore adverts weaker than this, in dbm
-settle_seconds = 3                # wait this long after the first advert before paging
-absence_seconds = 15              # silence at least this long ends a presence episode
-fallback_first_seconds = 20       # wait this long after a disconnect before the first page sent without an advert
-fallback_interval_seconds = 45    # wait between later pages sent without an advert
-fallback_minutes = 10             # keep paging without an advert for at most this long; 0 disables the fallback
+enabled = true
+min_rssi = -90
+settle_seconds = 3
+absence_seconds = 15
+fallback_first_seconds = 20
+fallback_interval_seconds = 45
+fallback_minutes = 10
 ```
 
-### `device` and `primary_bud`
-
-- `device` pins one BD_ADDR instead of auto-detecting the paired accessory.
-- `primary_bud` sets which bud the accessory's primary byte in an ear
-  detection packet describes. the accessory never says which side is
-  primary, and it changes as buds go in and out of the ear, so `"auto"`
-  resolves it from the battery packet instead of guessing a fixed side.
-  default `"auto"`.
-
-### `[ble]`
-
-opt-in bounded BLE battery observation. requires provisioned identity keys.
-see [battery observation and handoff safety](../docs/BATTERY_AND_HANDOFF.md)
-before enabling it.
-
 | key | default | effect |
 |---|---|---|
-| `enabled` | `false` | turns the observer on. requires an absolute `key_file` path |
-| `key_file` | none | private JSON file with `address`, `irk` and `encryption_key` fields |
-| `scan_seconds` | `8` | seconds of discovery in each interval, 2 to 30 |
-| `interval_seconds` | `30` | seconds between the beginnings of discovery windows, at least `scan_seconds + 5` and at most 300 |
-| `freshness_seconds` | `75` | age beyond which an observed BLE cell is shown as historical, at least `interval_seconds + scan_seconds` and at most 600 |
+| `device` | none | pin one BD_ADDR instead of auto-detecting the paired accessory |
+| `primary_bud` | `"auto"` | which bud the primary byte of an ear detection packet describes, `"auto"`, `"left"` or `"right"`. the accessory never names it and it moves as buds go in and out, so `"auto"` resolves it from the battery packet |
+| `[ble] enabled` | `false` | opt-in bounded BLE battery observation. needs an absolute `key_file` |
+| `[ble] key_file` | none | private JSON file with `address`, `irk` and `encryption_key` |
+| `[ble] scan_seconds` | `8` | discovery per interval, 2 to 30 |
+| `[ble] interval_seconds` | `30` | between window starts, at least `scan_seconds + 5`, at most 300 |
+| `[ble] freshness_seconds` | `75` | age after which a BLE cell is historical, at least `interval_seconds + scan_seconds`, at most 600 |
+| `[handoff] enabled` | `false` | yield to other Apple hosts and take over on local playback. `auris handoff on` sets it |
+| `[handoff] take_over_on_play` | `true` | take the AirPods back when a local player starts |
+| `[handoff] bt_name` | none (effective `"Mac"`) | name announced to other Apple hosts, 1 to 32 bytes, no control characters. unusable values fall back to `"Mac"` |
+| `[handoff] rejoin_after_eviction` | `true` | reconnect once when an Apple host's fresh link made the AirPods drop this host. needs `enabled` |
+| `[ear] auto_pause` | `true` | pause local players when a bud leaves an ear |
+| `[ear] auto_resume` | `true` | resume the player auris paused once the bud is back, if nothing else touched playback |
+| `[ear] pause_on_one_of_two` | `true` | pause when one of two in-ear buds leaves, as macOS does. `false` waits for the last bud, for one-bud listeners who swap sides |
+| `[autoconnect] enabled` | `true` | scan for the BLE proximity advert and page once per presence episode |
+| `[autoconnect] min_rssi` | `-90` | ignore weaker adverts, in dBm, to keep another room out |
+| `[autoconnect] settle_seconds` | `3` | wait after the first advert before paging, so a nearer preferred host wins |
+| `[autoconnect] absence_seconds` | `15` | silence this long ends a presence episode. the next advert is a new case opening |
+| `[autoconnect] fallback_first_seconds` | `20` | wait after a remote or timed-out disconnect before the first page sent without an advert |
+| `[autoconnect] fallback_interval_seconds` | `45` | wait between later pages without an advert |
+| `[autoconnect] fallback_minutes` | `10` | stop paging without an advert this long after the disconnect. `0` leaves only the advert trigger |
 
-no keys are automatically requested or imported. discovery is disabled by
-default. invalid BLE configuration fails closed.
+`[ear]` is on by default because the 0x0006 report exists for it and other
+platforms already use it.
 
-### `[handoff]`
-
-Apple multi-host switching over AAP.
-
-| key | default | effect |
-|---|---|---|
-| `enabled` | `false` | yield to other Apple hosts and take over on local playback. `auris handoff on` sets this |
-| `take_over_on_play` | `true` | take the AirPods back when a local player starts playing |
-| `bt_name` | none (effective `"Mac"`) | name announced to other Apple hosts, 1 to 32 bytes with no control characters. an unusable value falls back to `"Mac"` |
-| `rejoin_after_eviction` | `true` | reconnect once when an Apple host's fresh connection made the AirPods drop this host. needs `enabled` |
-
-handoff needs bluez's `DeviceID` set to Apple and a re-pair. see the top-level
+handoff needs bluez `DeviceID` set to Apple and a re-pair. see the top-level
 readme and
 [Apple multi-host switching](../docs/BATTERY_AND_HANDOFF.md#apple-multi-host-switching).
 
-`auris take-over` and `auris yield` act immediately on an open AAP link,
-independent of `take_over_on_play`.
-
-### `[ear]`
-
-in-ear detection driving the local media players. it is on by default, because it is what
-the hardware is for and what other platforms already do with the 0x0006
-report.
-
-| key | default | effect |
-|---|---|---|
-| `auto_pause` | `true` | pause local players when a bud leaves an ear |
-| `auto_resume` | `true` | resume the player auris paused, once the bud is back in and nothing else has touched playback meanwhile |
-| `pause_on_one_of_two` | `true` | pause as soon as one of two in-ear buds leaves, matching macOS. `false` waits for the last bud, for one-bud listeners who swap sides while the music plays |
-
-### `[autoconnect]`
-
-pages the AirPods when their BLE proximity advert appears. bluez never pages
-a classic device on its own, so a host only gets the AirPods when they happen
-to page it. a Mac listening for the same advert wins that race otherwise.
-
-the advert scan needs LE on the adapter. with `ControllerMode = bredr` in
-`/etc/bluetooth/main.conf` the scan can never start, so aurisd logs one
-warning and waits for the adapter to change, since bluez reads
-`ControllerMode` only at start. it rechecks every 5min in case it missed
-that. an unpowered or missing adapter is waited on the same way, and any
-other scan error is retried with a wait that grows from 5s to 5min. the page
-fallback keeps working throughout, for its first 10min after a drop. the
-current state is `autoconnect.scan` in `state.json`.
-
-| key | default | effect |
-|---|---|---|
-| `enabled` | `true` | scan for the advert and page once per presence episode |
-| `min_rssi` | `-90` | ignore adverts weaker than this, in dBm, to keep another room out |
-| `settle_seconds` | `3` | wait this long after the first advert before paging, so a nearer preferred host gets the link first |
-| `absence_seconds` | `15` | silence of at least this long ends a presence episode. the next advert after it is a new case opening |
-| `fallback_first_seconds` | `20` | wait this long after a remote or timed-out disconnect before the first page sent without an advert |
-| `fallback_interval_seconds` | `45` | wait between later pages sent without an advert |
-| `fallback_minutes` | `10` | keep paging without an advert for at most this long after the disconnect. `0` turns the fallback off and leaves only the advert trigger |
+bluez never pages a classic device on its own, so without `[autoconnect]` a
+Mac listening for the same advert wins the race. the advert scan needs LE on
+the adapter. with `ControllerMode = bredr` in `/etc/bluetooth/main.conf` it
+cannot start, aurisd logs one warning and waits for the adapter to change
+(bluez reads `ControllerMode` only at start). the page fallback keeps working
+for its first 10min after a drop. retry timing per fault is under
+[autoconnect](#autoconnect).
 
 ### BLE safety
 
-BLE requires provisioned identity keys and a pinned paired device. see
+BLE needs provisioned identity keys and a pinned paired device. no keys are
+requested or imported automatically, discovery is off by default, and invalid
+BLE configuration fails closed. read
 [battery observation and handoff safety](../docs/BATTERY_AND_HANDOFF.md)
 before enabling it.
 
-malformed main configuration stops startup. it does not silently discard the
-pinned device and fall back to a different paired accessory.
-
 ## state and socket
 
-### what it writes
+### state file
 
 `$XDG_RUNTIME_DIR/aurisd/state.json`, replaced atomically on every change.
-read it, watch it, whatever you like. `aurisd --dump-schema` prints an
-example.
+`aurisd --dump-schema` prints an example.
 
 ```json
 {
@@ -425,155 +275,102 @@ example.
 }
 ```
 
-#### daemon
+#### daemon and battery
 
-- `daemon.source` is `aap` while the control link is up. otherwise it is
-  `ble` if a current BLE battery observation exists, otherwise `none`.
-- BLE observation never implies connected audio.
+- `daemon.source` is `aap` while the control link is up, else `ble` if a
+  current BLE battery observation exists, else `none`. BLE observation never
+  implies connected audio.
+- battery cells follow the
+  [freshness rules](../docs/BATTERY_AND_HANDOFF.md). only reports refresh a
+  cell. `battery.stale` means no cell is fresh. nullable
+  `last_known_charging` is the last reported charging state, so check
+  `fresh` and `present` before treating it as live.
+- the buds relay the case only while it holds them. out of the case
+  `case.present` is false, `level` keeps the last reading and `last_seen`
+  says when. no case-expiry timer exists, battery packets mark components
+  absent. the AAP idle watchdog (300s, then a 15s probe grace) detects a
+  silent control link, not a case timeout. the firmware's case-reporting
+  window is unmeasured.
+- a missing `fresh` in old snapshots defaults to false. the plugin still
+  reads the legacy global stale flag.
+- levels are cached in `~/.cache/aurisd` (0600, bound to the paired address)
+  and restored at startup only for an explicitly pinned matching device.
 
-#### battery
+#### ear and device
 
-- each battery cell adds `source` and `fresh`. opening an AAP link does not
-  refresh old cells. only reports do. `battery.stale` means no cell is fresh.
-- the buds only relay the case while they sit in it. out of the case,
-  `case.present` goes false, `level` keeps the last reading and `last_seen`
-  says when.
-- the levels are cached in `~/.cache/aurisd`, so they survive a restart.
-- each cell's nullable `last_known_charging` retains its last reported
-  charging state alongside `level` and `last_seen`. check per-cell `fresh`
-  and `present` before treating it as live.
-- old snapshots default missing `fresh` to false in the daemon. the plugin
-  supports older snapshots with the legacy global stale flag.
-
-the battery cache follows these rules.
-
-- caches are private (0600) and bound to the paired address.
-- startup restores them only for an explicitly pinned matching device.
-- old unbound cache files are ignored, not deleted. new reports replace them.
-
-there is no fixed case-expiry timer. battery packets mark components absent.
-
-the separate AAP idle watchdog waits 300 seconds, then allows a 15-second
-probe grace. that detects a silent control link, not a case timeout. the
-firmware's case-reporting window has not been measured here.
-
-#### ear and buds
-
-- `ear` is `in`, `out`, `case` or `unknown`. the current BLE observer only
-  adds battery observations. it does not guess lid or ear state.
-- 0x0006 names a primary and a secondary bud, never a left and a right. the
-  role moves, and whichever bud is out and working is the primary one.
-- `primary_bud = "auto"` resolves it from the battery packet, which does name
-  its component. so a bud on its own is mapped to the side it is actually on.
-- with both buds out there is nothing to go on, and it falls back to
-  left-first. pin `"left"` or `"right"` if you want it fixed.
-- `serial` and `firmware` come from the AirPods themselves. they are `null`
-  until the AirPods send them.
+- `ear` is `in`, `out`, `case` or `unknown`. the BLE observer adds battery
+  only, never lid or ear state.
+- 0x0006 names a primary and a secondary bud, never left and right. the role
+  moves, and the bud that is out and working is primary. `primary_bud = "auto"`
+  maps it through the battery packet, which names its component, so a lone
+  bud lands on its real side. with both buds out it falls back to left-first.
+  pin `"left"` or `"right"` to fix it.
+- `serial` and `firmware` come from the AirPods and are `null` until sent.
 
 #### link
 
-`link` says whether a missing link is healing itself. a UI can then keep the
-device on screen instead of dropping it for the six seconds a rejoin takes.
+`link` tells a UI whether a missing link is healing, so it can keep the device
+on screen through the 6s a rejoin takes.
 
-`link.status` takes one of these values.
-
-| value | when |
+| `link.status` | when |
 |---|---|
 | `connected` | whenever `device.connected` is true |
-| `reconnecting` | while a rejoin or auto-connect sequence is scheduled or connecting |
+| `reconnecting` | a rejoin or auto-connect sequence is scheduled or connecting |
 | `disconnected` | otherwise |
 
-`link.reason` is `null` unless the status is `reconnecting`.
-
-| value | meaning |
+| `link.reason` | meaning |
 |---|---|
-| `bud_switch` | the `0x0C` primary bud address report changed in the 15 seconds before the drop, so the buds moved their radio link to the other bud and cut this host doing it |
+| `bud_switch` | the `0x0C` primary bud address report changed in the 15s before the drop, so the buds moved their radio link and cut this host |
 | `taken_over` | an Apple host took the AirPods |
 | `link_lost` | a supervision timeout |
-| `auto_connect` | the proximity pager bringing them back after the case opened |
+| `auto_connect` | the proximity pager is bringing them back after the case opened |
 
-- `link.attempt` counts the `Device1.Connect` calls started in the current
-  sequence. it is `0` while the sequence is only waiting out its delay.
-- `link.since` is when the sequence started, RFC3339 in UTC with a `Z`. it is
-  `null` when there is no sequence.
-- both reset when the link comes back.
+`link.reason` is `null` unless `reconnecting`. `link.attempt` counts
+`Device1.Connect` calls in the current sequence, `0` while it only waits out
+its delay. `link.since` is the sequence start, RFC3339 UTC with a `Z`, `null`
+with no sequence. both reset when the link returns.
 
 #### autoconnect
 
-`autoconnect.scan` says whether the advert scan behind auto-connect on case
-open can run. the object is additive, so older readers can ignore it.
+`autoconnect.scan` says whether the advert scan can run. the object is
+additive, so older readers can ignore it. a fault stays until the next scan
+runs.
 
 | value | meaning |
 |---|---|
-| `idle` | no scan is running and the last one found nothing wrong, for example because the AirPods are connected or `enabled = false` |
+| `idle` | no scan running and nothing wrong last time, for example connected or `enabled = false` |
 | `scanning` | the LE discovery scan is running |
-| `le_disabled` | LE is off on the adapter, usually `ControllerMode = bredr`. aurisd waits for the adapter to change and rechecks every 5min |
-| `adapter_off` | the adapter is unpowered or missing. aurisd waits for it to return |
-| `failed` | the scan failed for another reason. aurisd retries with a wait that grows from 5s to 5min |
-
-a fault stays in place until the next scan runs. `auris status` adds a line
-for `le_disabled`, `adapter_off` and `failed`.
+| `le_disabled` | LE is off on the adapter, usually `ControllerMode = bredr`. waits for the adapter to change, rechecks every 5min |
+| `adapter_off` | adapter unpowered or missing. waits for it to return |
+| `failed` | other scan failure, retried with a wait growing from 5s to 5min |
 
 #### settings
 
-`settings_api` takes one of these values.
-
-| value | meaning |
-|---|---|
-| `3` | a rename is verified as well, under the key `name` in the maps below |
-| `2` | the readback fields below are present |
-| `1` | typed settings without them |
-| `0` | old schema-1 documents, which omit the field |
-
-- each value under `settings` is last confirmed device-reported state. `null`
-  means unknown. it does not mean off or unsupported.
-- additive `settings_report_seq` maps setting keys to report counters. an
-  actual repeat report increments its key. unrelated battery updates do not.
-  counters persist across control-link loss in the process, reset for a new
-  device or daemon, and are not command IDs.
+- `settings_api` is `3` when rename is verified too (key `name`), `2` with
+  the readback fields below, `1` for typed settings without them and `0` for
+  old schema-1 documents, which omit the field.
+- `settings` holds the last confirmed device-reported value per key. `null`
+  means unknown, not off or unsupported.
+- `settings_report_seq` (additive) maps keys to report counters. a real repeat
+  report increments its key, battery updates do not. counters survive
+  control-link loss within the process, reset for a new device or daemon, and
+  are not command IDs.
 - `settings_requested` is the last value written per key in this daemon's
-  lifetime, in the same JSON shape `settings` uses for that key. it is what
-  was asked for, never what the accessory holds. the key `name` is a
-  requested accessory name, and its reported counterpart is `device.name`.
-
-`settings_status` is the readback verdict per requested key. the write itself
-went out in every case.
-
-| value | meaning |
-|---|---|
-| `verifying` | written, readback running |
-| `confirmed` | a fresh dump reported the requested value |
-| `mismatch` | a fresh dump reported something else, and `settings` holds that value |
-| `unreported` | the readback ran and this model never reports the key, which covers microphone and listening-mode cycle on AirPods 4 (ANC) |
-| `unverified` | no readback could be completed within 10s |
-
-`settings_verify` is `idle`, `scheduled` (a write is waiting out the 1500ms
-debounce) or `reopening` (the AAP link is being reopened to read settings
-back).
-
-`verify_reopen` is true only while that readback reopen is in progress.
-`device.connected` and `device.aap_link` can go false during it. a UI should
-keep showing the device as connected while this flag is true.
-
-##### why the readback is a reopen
-
-the accessory stores a setting write silently. it dumps its settings exactly
-once per AAP link, about 13ms after the set-features ack.
-
-nothing sent on an open link makes it dump again. so the readback is a link
-reopen in three steps.
-
-1. one write datagram
-2. a debounce, so a burst of writes shares one reopen
-3. a fresh link, whose dump is compared against `settings_requested`
-
-only reports from that new link count. no write is ever replayed. bluez is
-never asked to reconnect the device.
+  lifetime, in the shape `settings` uses. it is what was asked for, never
+  what the accessory holds. its `name` is the requested name, reported in
+  `device.name`.
+- `settings_verify` is `idle`, `scheduled` (waiting out the 1500ms debounce)
+  or `reopening` (reopening the AAP link to read back).
+- `verify_reopen` is true only during that reopen. `device.connected` and
+  `device.aap_link` can go false meanwhile, and a UI should keep showing the
+  device as connected.
+- `settings_status` is the verdict per requested key, listed under
+  [what a setting write or rename reports](#what-a-setting-write-or-rename-reports).
 
 ### control socket
 
-commands go over `$XDG_RUNTIME_DIR/aurisd/ctl.sock`, one JSON object per line.
-the CLI is a thin wrapper, so anything else can talk to it too.
+`$XDG_RUNTIME_DIR/aurisd/ctl.sock`, one JSON object per line. the CLI is a
+thin wrapper over it.
 
 ```
 {"cmd":"set_noise_control","value":"anc"}
@@ -588,26 +385,23 @@ the CLI is a thin wrapper, so anything else can talk to it too.
 {"cmd":"set_setting","key":"personalized_volume","value":true}
 {"cmd":"reconnect"}
 {"cmd":"connect_once"}
+{"cmd":"take_over"}
+{"cmd":"yield"}
+{"cmd":"set_handoff","enabled":true}
 {"cmd":"status"}
 {"cmd":"subscribe"}
 ```
 
-answers are `{"ok":true}`, `{"ok":false,"error":"..."}`, or the state object
-for `status`.
-
-`subscribe` answers with the state object. it then sends another one every
-time anything changes, one per line, until you hang up.
-
-that connection stops reading requests, so send commands on a second one.
-
-it exists so a UI does not have to poll `state.json`. the file is replaced by
-rename, which file watchers do not reliably follow. the alternative is a
-timer that is both late and always running.
+replies are `{"ok":true}`, `{"ok":false,"error":"..."}`, or the state object
+for `status`. `subscribe` answers with the state object, then one more per
+change until the client hangs up, and reads no further requests, so send
+commands on a second connection. it exists because `state.json` is replaced
+by rename, which file watchers do not reliably follow, and polling is late
+and always running.
 
 ## works with
 
-anything that speaks AAP. names are known for these. anything else shows as
-its model id.
+anything that speaks AAP. unlisted models show their model id.
 
 | id | model |
 |---|---|
@@ -622,21 +416,18 @@ its model id.
 | 200A | AirPods Max |
 | 201F | AirPods Max (USB-C) |
 
-tested on AirPods 4 (ANC). noise control on models without it does nothing.
-the AirPods ignore the command.
+tested on AirPods 4 (ANC). noise control on models without it is ignored by
+the AirPods.
 
 ## how it works
 
-macOS and iOS talk to AirPods over AAP, Apple's Accessory Protocol. it runs
-on an L2CAP channel next to the audio link.
-
-the channel is PSM 0x1001. on linux that is in the dynamic range, so any user
-can connect to it once bluez has the classic link up. no capability, no
-vendor id trick.
+AAP runs on an L2CAP channel next to the audio link. PSM 0x1001 is in the
+dynamic range on linux, so any user can connect once bluez has the classic
+link up, with no capability or vendor id trick.
 
 ### opening sequence
 
-it waits for answers rather than sleeping.
+each step waits for its answer rather than sleeping.
 
 ```
 -> 00 00 04 00 01 00 02 00 00 00 00 00 00 00 00 00   handshake
@@ -646,58 +437,49 @@ it waits for answers rather than sleeping.
 -> 04 00 04 00 0f 00 ff ff ff ff ff                  request notifications
 ```
 
-set features has to be exactly 14 bytes. a 13 byte write goes through, and the
-AirPods quietly never send a battery packet.
-
-there are two known selector bytes, `d7` and `0e`. some firmware only answers
-one of them. so the daemon alternates per dial until one produces a battery
-packet, then sticks with it.
-
-on the `0e` variant it also subscribes before negotiating features. that is
-what the go daemon below does.
+set features must be exactly 14 bytes. a 13-byte write goes through and the
+AirPods never send a battery packet. the selector is `d7` or `0e`, and some
+firmware answers only one, so the daemon alternates per dial until one yields
+a battery packet, then keeps it. on `0e` it subscribes before negotiating
+features, as the go daemon below does.
 
 ### what the AirPods push
 
 | opcode | what |
 |---|---|
 | 0x0004 | battery, one entry per component. `02` right, `04` left, `08` case. status `01` charging, `02` discharging, `04` not here |
-| 0x0006 | ear detection, primary then secondary. `00` in ear, `01` out, `02` in case. other values seen in the wild, `03` among them, read as unknown |
-| 0x0009 | a control setting echoed back. `0d` noise control, `28` conversational awareness, `2e` adaptive level |
+| 0x0006 | ear detection, primary then secondary. `00` in ear, `01` out, `02` in case. other values (`03` among them) read as unknown |
+| 0x0009 | a control setting echoed back. `0d` noise control, `28` conversational awareness, `2e` adaptive level, `24` call controls. the other typed settings appear only in the dump at link open, if at all |
 | 0x001D | metadata, nul separated strings. pushed once, cannot be asked for |
 | 0x004B | speech ducking while conversational awareness is on. a level, not the on/off state |
 
-everything else is logged at debug and dropped.
+anything else is logged at debug and dropped.
 
 ### recovery rules
 
-if no battery packet arrives within 10s, the daemon asks again twice on the
-existing socket, then suppresses recovery.
+- no battery packet within 10s makes the daemon ask twice more on the same
+  socket, then suppress recovery. peer loss, send errors and unanswered idle
+  probes also suppress automatic redial.
+- another guarded attempt needs a newly observed local disconnected to
+  connected transition, or an explicit user command.
+- each AAP dial checks current bluez state and cancels when the observed link
+  generation changes.
+- there is no unattended bluetooth-connect loop. `connect-once` is explicit,
+  for a pinned paired device, and may take audio from another host.
 
-peer loss, send errors and unanswered idle probes also suppress automatic
-redial.
-
-another guarded attempt needs either a new observed local disconnected to
-connected transition, or an explicit user command.
-
-each AAP dial checks current bluez state. it cancels when the observed link
-generation changes.
-
-there is no unattended bluetooth-connect loop. `connect-once` is a separate,
-explicit command for a pinned paired device. it may take audio from another
-host.
-
-these checks reduce races. they do not prove that another host is idle. they
-do not guarantee protection from other applications' or bluez's connection
-policies.
+these checks reduce races. they do not prove another host is idle or protect
+against other applications' or bluez's connection policies.
 
 ## related
 
-these are where the protocol facts came from. nothing is copied from them.
+protocol facts came from these sources. nothing is copied from them.
 
 - [battery observation and handoff safety](../docs/BATTERY_AND_HANDOFF.md),
-  including opt-in setup, protocol references and limitations
-- [feature comparison](../docs/FEATURE_COMPARISON.md), including the
-  distinction between implemented and hardware-verified behavior
+  opt-in setup, protocol references and limitations
+- [protocol evidence](../docs/PROTOCOL_EVIDENCE.md), settings opcodes and the
+  readback contract
+- [features](../docs/FEATURES.md), implemented versus hardware-verified
+  behaviour
 - [LibrePods](https://github.com/librepods-org/librepods), the most complete
   AAP reference around
 - [airpods-battery](https://github.com/AlwxSin/airpods-battery), a go daemon

@@ -1,68 +1,25 @@
 # battery and handoff
 
-aurisd reads AirPods battery telemetry over the Apple Accessory Protocol (AAP)
-and, optionally, from encrypted bluetooth LE adverts. it also takes part in the
-AirPods' own multi-host ownership protocol, which moves the buds between this
-linux host, a Mac and an iPhone. the reference device is AirPods 4 ANC, product
-id `201B`.
+runtime behaviour of aurisd. the reference device is AirPods 4 ANC, product id `201B`. config keys and defaults are listed in the [daemon readme](../daemon/README.md).
 
 ## battery telemetry and freshness
 
-battery state is tracked per cell, covering the left bud, right bud and case. each cell
-carries its own `source`, `fresh`, `present`, `last_seen` and
-`last_known_charging`.
-
-the freshness rules are these.
+battery is tracked per cell (left, right, case). each cell has its own `source`, `fresh`, `present`, `last_seen` and `last_known_charging`, and a source writes only the cells it measured.
 
 - an AAP socket opening does not refresh old readings.
-- an absent reading preserves history. current charging becomes false. the panel
-  can still show its muted green bolt and a "last seen charging ... ago"
-  caption.
-- exact zero is a real level, not unknown.
-- a report cannot refresh an unreported cell just because another cell changed.
+- an absent reading keeps history and sets current charging false (the panel shows a muted bolt and "last seen charging ... ago").
+- exact zero is a real level.
+- a report never refreshes a cell it did not report.
 
-battery caches are private and address-bound.
+caches are private and address-bound. startup restores only the pinned device's cache, and ignores (does not delete) unbound caches until new measurements replace them. without a pin, startup never guesses an old cache's owner.
 
-- startup restores only a matching pinned device's cache.
-- old unbound caches are ignored, not deleted. new measurements replace them.
-- without a pinned address, retained runtime history still works. startup
-  does not guess which device owned an old cache.
+## BLE observation
 
-per-cell tracking is what lets the interface separate a level that is current
-from one that is only remembered. it also lets a second source be added without
-changing any display rule, because a source writes only the cells it measured.
+off by default. the observer resolves the rotating address with the pinned device's identity resolving key (IRK), decrypts the proximity battery block and updates only the cells it measured, filling gaps while no host holds an audio link. it never makes the status bar claim connected audio. it cannot be a default, because the keys exist only on a device the owner controls and linux has no provisioning path.
 
-## BLE observation and its key requirement
+### keys
 
-the BLE observer is optional and off by default. it resolves the AirPods'
-rotating addresses with the pinned device's identity resolving key, decrypts
-that device's proximity battery block, and updates only the cells it measured.
-it fills battery gaps while no audio link exists. a nearby BLE reading never
-makes the status bar claim connected audio.
-
-### the key requirement
-
-observation needs two secrets held by the device owner. one is the IRK that
-resolves the rotating address, and the other is the AES key that decrypts the battery block. auris
-does not acquire or import either from another application.
-
-config lives in `~/.config/aurisd/config.toml`, with the owned, paired classic
-address pinned.
-
-```toml
-device = "AC:DE:48:00:11:22" # example only: replace with your device
-
-[ble]
-enabled = false
-key_file = "/absolute/private/path/keys.json"
-scan_seconds = 8
-interval_seconds = 30
-freshness_seconds = 75
-```
-
-the key file must be a regular file owned by the daemon's user, mode `0600` with
-no group or other access, at most 4096 bytes, and not a symlink. it contains
-exactly this.
+auris does not acquire or import the IRK or the AES battery key from another application. `[ble] key_file` names a regular file (not a symlink) owned by the daemon's user, mode `0600` with no group or other access, at most 4096 bytes, containing exactly this (placeholder values).
 
 ```json
 {
@@ -72,827 +29,244 @@ exactly this.
 }
 ```
 
-those two values are placeholders, not valid keys. keys belong in that file
-alone, never in a commit, a log or an issue.
+- `address` must match the pinned classic address. keys never go in a commit, log or issue.
+- IRK matching uses bluetooth's short address hash and is **not authenticated encryption**. an advert never authorises a connection or security decision.
+- a wrong encryption key can give plausible numbers. check against AAP readings across bud, case and charging states.
+- AES is the [RustCrypto aes crate](https://docs.rs/aes/0.8.4/aes/). byte order follows [LibrePods BLE crypto handling](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/ble/bleutils.cpp).
 
-the keys have these constraints.
+### advert layout
 
-- the classic identity must match the pinned address.
-- IRK matching uses bluetooth's short address hash. it is **not authenticated
-  encryption**. an advert must never authorise a connection or a security
-  decision.
-- a wrong encryption key can produce plausible numbers. observed percentages
-  should be compared against AAP readings across bud, case and charging states
-  before the output is trusted.
-- AES comes from the [RustCrypto aes crate](https://docs.rs/aes/0.8.4/aes/), not
-  from a local cipher implementation.
-- byte order follows [LibrePods BLE crypto
-  handling](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/ble/bleutils.cpp).
+one 27-byte Apple manufacturer `0x004c` record, type `0x07`, model bytes `1b 20`, paired format `01`. the last 16 bytes are one AES block. battery bytes 1 to 3 are seven-bit percentages with a charging high bit. primary-side bit `0x20` sets left and right order. case data is used only when the reporting-bud-in-case bit `0x40` is set. other layouts, public coarse percentages, inferred ear and lid states and remote-host "free" flags are ignored. the layout follows the [LibrePods proximity parser](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/ble/blemanager.cpp) and [encrypted battery layout](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/battery.hpp). the auris code is written independently.
 
-### supported advert layout
-
-one 27-byte Apple manufacturer `0x004c` record, type `0x07`, model bytes
-`1b 20`, paired format `01`.
-
-- the last 16 bytes are one AES block.
-- battery bytes 1 to 3 use seven-bit percentages with a charging high bit.
-- primary-side bit `0x20` determines left and right order.
-- case data is used only when the reporting-bud-in-case bit `0x40` is set.
-
-other layouts are ignored. public coarse percentages, inferred ear and lid
-states, and remote-host "free" flags are not used.
-
-the layout follows the [LibrePods proximity
-parser](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/ble/blemanager.cpp)
-and its [encrypted battery
-layout](https://github.com/librepods-org/librepods/blob/53679cc90222e94ade84e66542d97ace2540e626/linux/battery.hpp).
-the auris implementation is written independently.
-
-### source precedence
+### precedence and discovery
 
 - unknown `127` values do not reset age.
-- a freshly reporting AAP cell wins for 15 seconds. that stops the source
-  alternating on duplicate adverts. afterwards a new exact BLE reading may
-  replace it.
-- AAP absence does not erase a fresh BLE reading.
-- losing the AAP link invalidates AAP cells. it does not invalidate
-  independently observed BLE cells.
+- a freshly reporting AAP cell wins for 15s so duplicate adverts do not flip the source. then a new exact BLE reading may replace it.
+- AAP absence does not erase a fresh BLE reading. losing the AAP link invalidates AAP cells only.
+- a BLE reading becomes historical after 75s without a new measurement. **that is auris policy, not the Apple case sleep timeout.**
+- discovery is LE only, 8s per 30s by default. it may send scan requests and affect a busy or older adapter, so it is not physically passive.
+- a window end releases only this client's scan token, never another application's discovery.
+- bluez's cached manufacturer data is ignored. only a new manufacturer-data event refreshes.
 
-### discovery behaviour
-
-- discovery is LE-only, for eight seconds per thirty-second window by default.
-- it may transmit scan requests and affect a busy or older adapter. physically
-  passive scanning is not promised.
-- only this client's scan token is released when a window ends. auris does not
-  stop another application's discovery.
-- bluez's cached manufacturer data is ignored. a subsequent manufacturer-data
-  event is required to refresh an observation.
-- a BLE reading becomes historical after 75 seconds without a new cell
-  measurement. **that is the auris freshness policy, not the Apple case sleep
-  timeout.** silent hardware cannot provide fresh data.
-
-[bluez discovery semantics](https://bluez.readthedocs.io/en/latest/adapter-api/)
-and the [bluer discovery
-API](https://docs.rs/bluer/0.17.4/bluer/struct.Adapter.html#method.discover_devices)
-describe shared discovery and initially known devices.
-
-the observer extends battery reporting into the periods when no host holds an
-audio link. it cannot become a default, because the keys it needs exist only on
-a device the owner already controls, and no provisioning path for them exists on
-linux.
+see [bluez discovery](https://bluez.readthedocs.io/en/latest/adapter-api/) and [bluer discover_devices](https://docs.rs/bluer/0.17.4/bluer/struct.Adapter.html#method.discover_devices).
 
 ## Apple multi-host switching
 
-handoff is opt-in, enabled with `[handoff] enabled = true` or `auris handoff on`.
+opt-in with `[handoff] enabled = true` or `auris handoff on`. auris joins the AirPods' own ownership protocol over its AAP channel (L2CAP PSM `0x1001`), as LibrePods does on Android, instead of racing a Mac or iPhone for the audio link.
 
-auris takes part in the AirPods' own ownership protocol over the AAP channel it
-already holds, L2CAP PSM `0x1001`. that is the mechanism LibrePods uses on
-Android. auris does not race a Mac or an iPhone for the audio link.
-
-Apple hosts cooperate only with a host whose bluetooth Device ID names Apple.
-the adapter must advertise `DeviceID = bluetooth:004C:0000:0000`, and the
-AirPods must be paired again afterwards. `handoff.apple_host_id` in state.json
-reports the adapter's `Modalias`, and is `null` when bluez exposes none.
+Apple hosts cooperate only with a host whose Device ID names Apple. the adapter must advertise `DeviceID = bluetooth:004C:0000:0000` and the AirPods must then be paired again. `handoff.apple_host_id` in `state.json` reports the adapter `Modalias`, or `null` when bluez exposes none.
 
 ### opcodes
 
-addresses marked *reversed* are sent least significant byte first. payload
-offsets are counted after the six-byte `04 00 04 00 <opcode LE>` header.
+*reversed* addresses are least significant byte first. offsets count after the `04 00 04 00 <opcode LE>` header.
 
 | opcode | direction | payload | auris use |
 |---|---|---|---|
-| `0x000C` | AirPods to host | address (reversed), 2 unknown bytes | decoded and logged only |
-| `0x000E` audio source | AirPods to host | address (reversed), status `00` idle / `01` call / `02` media | `handoff.audio_source`, and another host at `01` or `02` triggers a yield |
-| `0x002E` connected devices | AirPods to host | 2 unknown bytes, count, then per host address (**not** reversed) + 2 info bytes | `handoff.devices`, take-over targets, and new hosts get media info + `newTipi` |
-| `0x0010` smart routing | host to AirPods | target address (reversed), u16 LE body length, `01`, OPACK dictionary | media info, `Hijackv2`, `newTipi` |
-| `0x0011` smart routing relay | AirPods to host | sender address (reversed), u16 LE length, OPACK body | `audioRoutingSetOwnershipToFalse` in the body triggers a yield |
-| `0x0009` control id `0x06` | both | `01` owns connection, `00` does not | `handoff.owner`, and `00` on an established link triggers a yield |
+| `0x000C` | AirPods to host | address (reversed), 2 unknown bytes | logged only |
+| `0x000E` audio source | AirPods to host | address (reversed), `00` idle, `01` call, `02` media | `handoff.audio_source`. another host at `01`/`02` yields |
+| `0x002E` connected devices | AirPods to host | 2 unknown bytes, count, per host address (**not** reversed) + 2 info bytes | `handoff.devices`, take-over targets. new hosts get media info + `newTipi` |
+| `0x0010` smart routing | host to AirPods | target (reversed), u16 LE length, `01`, OPACK dict | media info, `Hijackv2`, `newTipi` |
+| `0x0011` smart routing relay | AirPods to host | sender (reversed), u16 LE length, OPACK body | `audioRoutingSetOwnershipToFalse` yields |
+| `0x0009` control `0x06` | both | `01` owns, `00` does not | `handoff.owner`. `00` on an established link yields |
 
-decoder fixtures for AirPods 4 ANC (`201B`) live in `daemon/src/aap/codec.rs`
-tests. they include the byte-order check that the same host decodes identically
-from `0x000E` (reversed) and `0x002E` (forward).
+fixtures for `201B` are in the `daemon/src/aap/codec.rs` tests, including one host decoding identically from `0x000E` (reversed) and `0x002E` (forward).
 
-### the `0x002E` info bytes
+### `0x002E` info bytes
 
-each listed host carries two info bytes after its address. byte 0 is that host's
-own link state to the AirPods.
+| byte 0 | meaning | seen |
+|---|---|---|
+| `0x00` | listed, link down | after that host disconnects |
+| `0x01` | connecting | a few seconds before its link is up |
+| `0x02` | link up | from link up. `0x01` to `0x02` takes about 80ms on reconnect |
 
-| byte 0 | meaning |
-|---|---|
-| `0x00` | listed, link down |
-| `0x01` | connecting |
-| `0x02` | link up |
+hosts stay listed after disconnecting, so only byte 0 says who is connected. the rejoin classifier depends on it. byte 1 (`0x15`/`0x17` for a Mac, `0x01`/`0x03` here) and the second header byte (`00` before an Apple host relays smart routing, `02` after) are unexplained and not read.
 
-a host stays on the list for a while after it disconnects, so membership of the
-list does not mean connected. byte 0 is the part that says which. it reads
-`0x00` on the reports that follow a remote host's disconnect. it reads `0x01`
-for a few seconds before that host's link comes up, and `0x02` from the moment
-it is up. a host reconnecting moves from `0x01` to `0x02` within about 80ms.
+### what each host observes
 
-byte 1 varies independently, `0x15` or `0x17` for a Mac and `0x01` or `0x03` for
-this host. its meaning is unknown and auris does not read it. the second byte of
-the report header is likewise unexplained. it reads `00` before an Apple host
-has relayed a smart-routing message and `02` afterwards.
+an Apple host claiming compares the audio category score this host published with its own, reads the AirPods' advertised stream state, and sends smart routing that arrives here as an `0x0011` relay with `audioRoutingSetOwnershipToFalse`. this host yields, the AirPods send `06 = 00` and report the new source over `0x000E`, then tear down this host's A2DP stream when the other host routes audio.
 
-byte 0 is the evidence the rejoin classifier uses to tell "another host holds
-the AirPods" from "another host is merely remembered". without it, a stale list
-entry would qualify every disconnect.
+this host claiming sends `06 = 01`, media information and `Hijackv2` to every other listed host. the Apple host checks the name and model, gives up ownership, shows a banner naming the taker and routes audio to its speakers (`RouteToSpeaker` in macOS). the AirPods report the source idle, then this host once a stream flows.
 
-## what each host observes during a switch
+with equal category scores the streaming host keeps the AirPods. an owner that starts no stream is hijacked back within about 10s. `btName` `Mac` and `iPhone` pass the name check. ownership and stream are separate. any host starting A2DP takes the audio, so a notification sound here interrupts the owning host, and a yield must release the local audio route too.
 
-the two sides of a switch see different halves of the same event, in a fixed
-order.
+a Mac connecting fresh while this host holds the link makes the AirPods drop this host within about 0.5s, with no disconnect from the Mac, which logs `IsHeadphoneEligibleForTipiV2: Skip reason: ConnectedSourceDiffiCloud` (different iCloud account). connecting this host second keeps both, and handoff works both ways. rejoin recovers the first order.
 
-a claim by another Apple host runs in this order.
+### yield
 
-1. the other host compares the audio category score this host published against
-   its own, and reads the AirPods' advertised stream state.
-2. it sends a smart-routing message that reaches this host as an `0x0011` relay
-   containing `audioRoutingSetOwnershipToFalse`.
-3. this host yields.
-4. the AirPods send control `06 = 00` toward this host and report the new audio
-   source over `0x000E`.
-5. the other host routes its audio to the AirPods, and the AirPods tear down
-   this host's A2DP stream.
+reports update `handoff` state even with handoff disabled. only acting is gated. each AAP link opens with a state dump that can name a long-idle host, so an opening window runs from link up to the later of 3s and the end of the settings dump (first battery packet or readback timeout), capped at 10s. reports inside it update state but never yield, pause, hold or introduce a host. a relayed ownership-to-false request is live and still counts.
 
-a claim by this host runs in this order.
+a yield needs a relayed `audioRoutingSetOwnershipToFalse` (`Hijackv2`), a `06 = 00` after the window, or an audio-source report after the window that changes the source to another host at call or media (a repeated snapshot is no change). auris then pauses Playing MPRIS players, releases the audio route, and sends `06 = 00` unless the AirPods sent it first. a further request while yielded renews the hold.
 
-1. this host sends `06 = 01`, then media information, then `Hijackv2` to every
-   other listed host.
-2. the Apple host runs an ownership check on the name and model in that media
-   information.
-3. it gives up ownership, shows a banner naming the taking host, and routes its
-   own audio to its speakers. macOS calls that step `RouteToSpeaker`.
-4. the AirPods report the audio source as idle, then as this host once a stream
-   flows.
+A2DP and HFP stay connected, as on Apple hosts. `DisconnectProfile` does not stick (bluez and the audio server restore the profile about 10s later, moving the stream and flipping the source), and linux has no equivalent of the Android per-device connection policy LibrePods uses short of editing wireplumber policy or blocking the device.
 
-the acceptance rules on the Apple side are visible in its own behaviour.
+### yielded hold
 
-- it compares the audio category score both hosts published. with the scores
-  equal, the host that is actually streaming keeps the AirPods.
-- it reads the AirPods' advertised stream state. an owner that has not started a
-  stream is hijacked back within about ten seconds.
-- it checks the other host's reported name and model before relinquishing.
-  `btName` values `Mac` and `iPhone` are accepted.
+players restart when a yield removes their sink. after any yield (automatic or `auris yield`) a local Paused to Playing edge is a self-resume when it lands within 2.5s of the auris pause or the peer's latest request, or within 2.5s of a bluez `Connected` change, an audio profile endpoint change, a `MediaTransport1` change or an audio-source report naming this host. the player is re-paused by MPRIS bus name, never taken over. an audio-source report naming this host as media while held also re-pauses, unless a play edge is pending. each player is re-paused once per request. a second resume before a new request is a user press and goes to take-over.
 
-ownership and the audio stream are separate mechanisms. any host that starts an
-A2DP stream takes the AirPods' audio, whether it owns them or not. a short
-notification sound played here while another host owns the AirPods acquires the
-local transport and interrupts that host's playback. yielding therefore has to
-release the local audio route as well as ownership.
+a self-resume lands about 0.5s after a sink change. the audio-change window stays 2.5s because every yield fires an audio-change event, and 5s would swallow a press 4s later.
 
-connection order also matters. a Mac connecting fresh to AirPods that already
-hold this host's link makes the AirPods drop that link within about half a
-second. the Mac sends no disconnect of its own. it records
-`IsHeadphoneEligibleForTipiV2: Skip reason: ConnectedSourceDiffiCloud`, because
-the linux host is not on the same iCloud account. connecting this host second
-keeps both hosts, and handoff then works in both directions. the rejoin path
-below exists to restore the first case.
+the hold ends on take-over, a user play, an AAP link reset, or an idle or this-host audio-source report 10s or more after the latest request. a re-pause leaves `last_event` unchanged.
 
-## how auris yields
+### take-over
 
-reports are decoded into `handoff` state even while handoff is disabled. only
-acting on them is gated.
+needs `enabled`, `take_over_on_play` (default true) and a local MPRIS Paused to Playing edge that stays Playing 1.5s, is not the first reading since start or link open, is outside the hold windows, comes while another host owns the AirPods or auris released its audio, and not while the last audio-source report shows another host in a call. such a play ends the hold even when take-over is refused.
 
-### the opening window
-
-every AAP link opens with a state dump. that dump can name a host which stopped
-playing long ago, so it must not trigger anything.
-
-- audio-source, ownership and connected-device reports update `handoff` during
-  the window and do nothing else.
-- the window runs from link up until the later of 3s and the end of the
-  settings dump, which is the first battery packet or the readback timeout. it
-  is capped at 10s.
-- reports inside it never yield, pause, hold or introduce a host.
-- a relayed ownership-to-false request is a live message and still counts.
-
-### what triggers a yield
-
-a yield needs a real request. any of these qualify.
-
-- a relayed smart-routing message carrying `audioRoutingSetOwnershipToFalse`
-  (`Hijackv2`).
-- control `06 = 00` from the AirPods after the opening window.
-- an audio-source report after the window that changes the source to another
-  host at call or media. a repeat of the same snapshot is not a change.
-
-on a yield auris pauses local MPRIS players that are Playing, releases the audio
-route, and only then sends `06 = 00`, unless the AirPods sent it first. the full
-order is under the pipewire audio route below. the A2DP and HFP profiles stay
-connected. the AirPods route by ownership, and a paused player sends nothing. a
-further request while already yielded renews the hold.
-
-profiles are left connected deliberately. `DisconnectProfile` on yield does not
-stick. the profile returns about ten seconds later from the bluez and audio
-server side, and its return moves the stream back and flips the reported source.
-LibrePods on Android holds A2DP down with a per-device connection policy. linux
-has no equivalent auris could set, short of editing the user's wireplumber
-policy or blocking the device outright. Apple hosts do not disconnect either.
-ownership plus a paused player is the whole mechanism.
-
-### the yielded hold
-
-after any yield, automatic or from `auris yield`, a local Paused to Playing edge
-counts as a player resuming itself when it lands in either of these windows.
-
-- within 2.5s of the auris pause, or of the peer's latest request, or
-- within 2.5s of a bluez `Connected` change, an audio profile endpoint change,
-  a `MediaTransport1` change, or an audio-source report naming this host.
-
-such a player is paused again by its MPRIS bus name. auris does not take it
-over. an audio-source report naming this host as media while held also pauses
-the local player, unless a play edge is still pending.
-
-each player is paused again at most once per request. the same player resuming
-again before a new request is a user pressing play, and goes to the debounced
-take-over path.
-
-both windows are 2.5s. the audio-change window cannot be wider, because the
-pipewire profile follows ownership. every yield switches the card profile off
-and fires an audio-change event at once. a 5s window there swallows a user
-press four seconds after a yield. a self-resume after a sink change lands about
-0.5s after it, so 2.5s covers the case it is there for.
-
-the hold ends on take-over, on a user play, or when the AAP link resets. it also
-ends on an audio-source report that is idle or names this host, when that report
-arrives 10s or more after the latest request. a re-pause leaves `last_event`
-unchanged.
-
-the hold exists because players restart themselves when their sink disappears,
-and a yield always removes their sink. it is bounded on both sides so that a
-deliberate press is never mistaken for that restart.
-
-## how auris takes over
-
-take-over needs `enabled` and `take_over_on_play`, default true. it needs a
-local MPRIS Paused to Playing edge that meets all of these conditions.
-
-- stays Playing for 1.5s
-- is not the first reading since start or link open
-- is outside the hold windows
-- happens while another host owns the AirPods, or while auris released its audio
-- does not happen while the last audio-source report shows another host in a
-  call
-
-such a play ends the hold even when take-over is not allowed.
-
-the sequence runs as follows.
-
-1. restore the pipewire bluez card profile, before any AAP write.
+1. restore the pipewire card profile, before any AAP write.
 2. send `06 = 01`.
-3. send media information, made up of `HostStreamingState YES`, `PlayingApp` from the
-   player's MPRIS `Identity`, `btAddress` of the local adapter, and `btName`
-   `Mac` unless `bt_name` is set.
+3. send media information with `HostStreamingState YES`, `PlayingApp` from MPRIS `Identity`, `btAddress` of the adapter and `btName` (`Mac` unless `bt_name` is set).
 4. send `Hijackv2` to every other listed host.
-5. call `Device1.ConnectProfile` for A2DP sink. already connected counts as
-   success.
+5. `Device1.ConnectProfile` for A2DP sink. already connected is success. busy (`br-connection-busy`) or in progress retries after 700ms, 1.5s and 3s, then warns. no retry once this host no longer owns.
 
-a connect refused as busy (`br-connection-busy`) or in progress is retried after
-700ms, 1.5s and 3s, then abandoned with a warning. no retry runs once this
-host no longer owns the AirPods.
+a Mac's check logs `_shouldAllowRelinquishOwnership _myModel Mac otherTipiName Mac` and answers `YES`, and the same for `iPhone`. no other `btName` has been seen to work. `auris take-over` and `auris yield` run the same steps immediately, need an open AAP link and work with automatic handoff disabled.
 
-`btName` defaults to `Mac` because an Apple host's ownership check is known to
-accept it. the check reads
-`_shouldAllowRelinquishOwnership _myModel Mac otherTipiName Mac` and answers
-`YES`, and it answers the same for `iPhone`. no other value has been observed to
-work, so a linux-looking name may be refused.
+### HostStreamingState and stream start
 
-### HostStreamingState
+an early or stalled `NO` invites the other host to take the AirPods back.
 
-- the take-over sends `YES`.
-- when the A2DP transport then becomes active, auris sends `YES` once more, as
-  one extra media information message with no second `Hijackv2`.
-- `NO` is sent only after local playback has stayed stopped for 3s. it is never
-  sent within 8s of a take-over while the stream is still starting.
-- a local play while owning, after a `NO`, sends `YES` again once audio flows.
+- take-over sends `YES`. when the A2DP transport goes active, one more media information message sends `YES`, with no second `Hijackv2`.
+- `NO` only after local playback stays stopped 3s, never within 8s of a take-over while the stream starts.
+- a local play while owning, after a `NO`, sends `YES` once audio flows.
 
-an early or stalled `NO` invites the other host to take the AirPods straight
-back, which is what these three rules prevent.
-
-### stream start after take-over
-
-auris watches `MediaTransport1.State` for the AirPods' A2DP transport. the check
-runs 3s after a take-over, while a local player is playing or stopped less than
-3s ago. if the state is neither `pending` nor `active`, auris logs
-`A2DP transport still idle 3 s after take-over`, naming the transport bluez
-reports.
-
-that warning is a diagnostic and takes no action. two remedies were tried in its
-place and both are gone.
-
-- cycling the A2DP profile, `DisconnectProfile` then `ConnectProfile`, removes
-  the transport and takes the whole link with it. bluez then fails to reload the
-  remote SEP (`Unable to load LastUsed: rseid 2 not found`), and wireplumber can
-  settle on the hands-free profile, which is audible as a drop in quality.
-- nudging the player over MPRIS, `Pause` then `Play` 300ms later, touches no
-  profile and churns no link. it does not make the audio server re-acquire a
-  transport that pipewire never released.
-
-the remedy that works is the audio route below, which creates a fresh pipewire
-node instead of trying to wake a failed one.
-
-`auris take-over` and `auris yield` run the same steps at once. both need an
-open AAP link, and both work while automatic handoff is disabled.
+3s after a take-over, while a player is playing or stopped under 3s ago, a `MediaTransport1.State` other than `pending` or `active` logs `A2DP transport still idle 3 s after take-over` with the transport path. it is diagnostic only. cycling A2DP (`DisconnectProfile`, `ConnectProfile`) drops the link, bluez fails to reload the remote SEP (`Unable to load LastUsed: rseid 2 not found`) and wireplumber can settle on hands-free. an MPRIS `Pause` then `Play` 300ms later does not make the audio server re-acquire a transport pipewire never released. both were removed. the audio route fixes it by creating a fresh node.
 
 ## reconnect and rejoin classification
 
 ### one attempt, then stop
 
-on a newly observed local bluetooth connection, auris makes one AAP attempt
-after an 800ms settle delay. it re-checks paired and `Connected` state
-immediately before dialling. an observed link or identity change invalidates
-in-flight opening work.
+a new local bluetooth connection gets one AAP attempt after 800ms, with paired and `Connected` re-checked just before dialling. a link or identity change invalidates in-flight opening work. peer loss, a failed send or an unanswered watchdog stops automatic recovery. there is no redial loop competing with a phone.
 
-peer loss, a failed send and an unanswered watchdog each stop automatic
-recovery. there is no exponential redial loop that can repeatedly compete with a
-phone.
-
-### the two explicit commands
-
-- `auris reconnect` retries only the settings and telemetry link, while the
-  device is already connected locally.
-- `auris connect-once` requests one bluetooth connection to the pinned paired
-  device, with no automatic retry. it can transfer audio. it is an intentional
-  user action, not "connect only if all other hosts are idle".
-
-neither command runs from BLE data.
-
-queued control commands are bound to the connection identity and epoch, with a
-four-second daemon deadline. an expired command is rejected before action, as is
-one whose connection has changed. a timeout cannot undo a bluetooth connection
-request already sent to bluez, so the actual link state has to be read before a
-retry.
-
-missing and malformed configuration are distinguished. a missing file uses
-defaults. malformed configuration stops startup rather than silently dropping a
-pin.
+`auris reconnect` retries only the AAP link while bluetooth is connected. `auris connect-once` requests one bluetooth connection to the pinned device with no retry. it can move audio and is a deliberate action, not "connect if others are idle". neither runs from BLE data. queued commands are bound to connection identity and epoch with a 4s deadline, and are rejected if expired or the connection changed. a timeout cannot undo a connect already sent to bluez, so read link state before retrying. a missing config uses defaults. malformed config stops startup rather than dropping a pin.
 
 ### auto-connect on case open
 
-`[autoconnect]`, on by default.
+`[autoconnect]`, on by default. AirPods leaving the case page only their last host. a Mac pages them itself on their BLE proximity-pairing advert, while bluez never pages a classic device, so without this the Mac wins.
 
-AirPods leaving their case page the host they last used, and only that host. a
-Mac in the room does not wait to be paged. it listens for the AirPods' own BLE
-proximity-pairing advert and pages them itself, so it wins whenever the AirPods
-choose someone else. bluez never pages a classic device on its own, which is why
-this host can sit disconnected for minutes while the Mac holds them.
+`autoconnect.rs` scans for the same advert (LE only, `duplicate_data` on, `discoverable` off) only while the AirPods are not connected locally. the scan needs LE. with `ControllerMode = bredr` it cannot start, the daemon warns once, rechecks every 5min or on adapter change, reports `autoconnect.scan` `le_disabled` in `state.json`, and only the page fallback connects.
 
-`autoconnect.rs` watches for that same advert and pages once per case opening.
-discovery is LE only, with `duplicate_data` on and `discoverable` off. it runs
-only while the AirPods are not connected locally. a local connection stops it,
-and a disconnect starts it again.
+an advert qualifies on company id `0x004C`, proximity-pairing type `0x07`, non-pairing-mode byte `0x01` and the model id little-endian (`1B 20` for `201B`, from the DID when known), at or above `min_rssi` (-90 dBm). weaker adverts are another room and not presence. cached `ManufacturerData` is never read, since bluez replays long-gone devices.
 
-the scan needs LE on the adapter. with `ControllerMode = bredr` in bluez it
-cannot start, so the daemon logs one warning, waits for the adapter to change
-and rechecks every 5min, and reports `autoconnect.scan` as `le_disabled` in
-`state.json`.
+a qualifying advert after `absence_seconds` (15) of silence starts an episode, in practice a case shut and reopened. an episode gets one sequence, a connect after `settle_seconds` (3, so a nearer preferred host can win), then retries at 5s, 15s and 45s (four attempts), each only with an advert in the last 10s.
 
-an advert qualifies when all of these hold.
+| disarm | detail |
+|---|---|
+| connect command or `Local` disconnect | `auris reconnect`, `auris connect-once` or `Device1.Disconnected` reason `Local`, until the next absence. aurisd never calls `Disconnect`, so `Local` is the user, panel or `bluetoothctl` choosing, and it sticks |
+| pending rejoin | rejoin owns eviction recovery. a `Remote`/`Timeout` drop starts the absence clock and the page fallback, not an episode (buds out of the case keep advertising) |
+| `enabled = false` | no discovery at all |
 
-- Apple's company id `0x004C` carries proximity-pairing type `0x07`.
-- the non-pairing-mode byte is `0x01`.
-- the watched accessory's model id is present in little-endian order. for the
-  AirPods 4 ANC product id `201B` that is `1B 20`, taken from the DID when
-  known.
+### page fallback
 
-cached `ManufacturerData` is never read on discovery, for the same reason the
-battery observer ignores it. bluez replays devices that are long gone.
+some dongles give no qualifying advert for a whole case cycle, and an LE-off adapter sees none. while the AirPods are disconnected, the machine is armed, the last disconnect was `Remote`/`Timeout` (or the daemon started disconnected) and no rejoin or episode is in flight, this host pages after `fallback_first_seconds` (20), then every `fallback_interval_seconds` (45), within `fallback_minutes` (10, `0` disables) from the drop.
 
-a presence episode begins with a qualifying advert that follows at least
-`absence_seconds` (default 15) of silence. in practice that means the case was
-shut and opened again. one episode gets at most one connect sequence.
+each page is one `Device1.Connect`, logged `no proximity advert since the disconnect; paging anyway` with `away` and `next`. a timeout waits for the next slot (`fallback page did not take; waiting for the next slot`). it ends on success, on `connected_by_other_means`, or at the budget, leaving only the advert trigger until the next drop. an episode takes priority without moving the fallback clock.
 
-- a first `Device1.Connect` after `settle_seconds` (default 3). the delay lets a
-  nearer host the user prefers take the link first.
-- then retries at 5s, 15s and 45s, up to four attempts.
-- only while an advert has been heard in the last 10s.
-
-adverts weaker than `min_rssi` (default -90 dBm) are treated as another room.
-they do not even count as presence.
-
-three things disarm the trigger, each logged with its reason.
-
-- `auris reconnect`, `auris connect-once`, or any `Device1.Disconnected` with
-  reason `Local`, until the next absence. aurisd never calls `Disconnect`
-  itself, so a `Local` reason is the panel, `bluetoothctl` or the user deciding
-  where the AirPods belong, and that decision has to stick.
-- a pending rejoin. the rejoin state machine owns eviction recovery, and this
-  path never pages over it. a `Remote` or `Timeout` drop therefore starts no
-  episode of its own. the drop starts the absence clock, and AirPods still out
-  of the case keep advertising, so no episode begins until they go away. the
-  drop does start the page fallback.
-- `enabled = false`, which also means no discovery at all.
-
-### page fallback when no advert arrives
-
-the advert trigger is not reliable on every adapter. some dongles produce no
-qualifying advert for a whole case cycle, and nothing pages. an adapter with LE
-off sees no advert at all, so for it this fallback is the only trigger. this
-host therefore pages on a slow cadence when all of these hold.
-
-- the AirPods are disconnected locally.
-- the machine is still armed, with no connect command and no `Local` disconnect since
-  the last absence.
-- the last disconnect was `Remote` or `Timeout`, or the daemon started
-  disconnected.
-- no rejoin and no advert episode is in flight.
-
-| setting | default | meaning |
-|---|---|---|
-| `fallback_first_seconds` | 20 | delay from the drop to the first page |
-| `fallback_interval_seconds` | 45 | gap between later pages |
-| `fallback_minutes` | 10 | total budget measured from the drop |
-
-after the budget, only the advert trigger remains until the next drop.
-`fallback_minutes = 0` turns the fallback off.
-
-each fallback page is one `Device1.Connect`, with no retry backoff. a page
-timeout waits for the next slot, logged as
-`fallback page did not take; waiting for the next slot`. the fallback for an
-away period ends on a connect that succeeds, or on one that finds the link
-already taken (`connected_by_other_means`). the pages are logged as
-`no proximity advert since the disconnect; paging anyway`, with `away` and
-`next`.
-
-an advert episode always takes priority and does not move the fallback clock. a
-failed episode therefore leaves the slow cadence to carry on inside the budget.
-
-both paths use the same guarded `bluez::rejoin_connect` as the rejoin path
-below. it re-reads adapter power, paired, blocked and connected state before
-calling `Device1.Connect` once. it is issued from the supervisor, so bluez never
-sees two sources of connect requests. logs are under the `aurisd::autoconnect`
-target.
+auto-connect, fallback and rejoin share the guarded `bluez::rejoin_connect`, which re-reads adapter power, paired, blocked and connected before one `Device1.Connect`, issued from the supervisor so bluez sees one connect source. logs use target `aurisd::autoconnect`.
 
 ### when a rejoin is allowed
 
-bluez `Device1.Disconnected(reason, message)` is logged at INFO on every
-disconnect. auris calls `Device1.Connect` only when all eight of the following
-hold as that signal arrives.
+every `Device1.Disconnected(reason, message)` logs at INFO. `Device1.Connect` runs only if all of these hold when it arrives.
 
-**1. enabled.** `[handoff] enabled` and `rejoin_after_eviction`, default true.
-
-**2. the reason qualifies.** only `org.bluez.Reason.Remote`, the AirPods
-dropping this host, or `org.bluez.Reason.Timeout`, the link supervision timer
-expiring.
-
-there is no rejoin for `Local` (panel, `bluetoothctl`, auris), `Authentication`,
-`Suspend`, `Unknown`, any other name, or no signal at all. a manual disconnect
-is always `Local`, so it can never reach a rejoin. ECONNRESET alone never
-counts.
-
-**3. the evidence report qualifies.** the latest `0x002E` report of the link
-session that just ended lists a host other than this one, and one of three
-conditions holds.
-
-| match kind | condition | what it describes |
+| # | check | rule |
 |---|---|---|
-| `joined` | the report arrived at most 1.5s before the `Disconnected` signal | an Apple host connecting and pushing this host off. it matches even when that host's info byte reads `0x01` |
-| `connected` | the listed Apple host's info byte 0 is `0x02`, at any report age | an Apple host that already held its own link and evicted this host anyway |
-| `link_lost` | the reason is `Timeout` and the listed Apple host's info byte 0 is `0x02`, at any report age | this host's link died while the Apple host kept its own |
+| 1 | enabled | `[handoff] enabled` and `rejoin_after_eviction` (default true) |
+| 2 | reason | `org.bluez.Reason.Remote` or `org.bluez.Reason.Timeout`. never `Local` (so never a manual disconnect), `Authentication`, `Suspend`, `Unknown`, others, no signal, or ECONNRESET alone |
+| 3 | evidence | the latest `0x002E` of the ended session lists another host and matches a kind below |
+| 4 | Apple host | that host matches by OUI or relay |
+| 5 | not put away | last ear report not both buds `0x02` (case), lid not known closed |
+| 6 | usable | adapter powered, AirPods paired and not `Blocked`. `Trusted` not required |
+| 7 | manual quiet | no `auris reconnect` or `auris connect-once` in 10s |
+| 8 | rate | a sequence in the last 60s defers the new one, it does not refuse |
 
-the window for `joined` is measured at the signal, because that is when the
-decision is made and the signal is required anyway. the AAP reset arrives tens
-of milliseconds earlier.
+| match kind | condition | describes |
+|---|---|---|
+| `joined` | report at most 1.5s before the signal, info byte `0x01` allowed. never for `Timeout` | an Apple host connecting and pushing this host off |
+| `connected` | host byte 0 `0x02`, any age | a host that already held its link evicting this one |
+| `link_lost` | `Timeout` and host byte 0 `0x02`, any age | this link died while the Apple host kept its own |
 
-`connected` and `link_lost` have no age cap. the AirPods send `0x002E` only on a
-change, so the newest report can be a minute old while nothing has changed.
-session scoping is what bounds them instead. the `joined` window never qualifies
-a `Timeout`. a report that arrives with the drop says nothing about who kept the
-AirPods, and only the link-up byte does.
+the `joined` window is measured at the signal (the AAP reset comes tens of ms earlier). `connected` and `link_lost` have no age cap because `0x002E` is sent only on change. scoping bounds them instead. only the latest report counts, a report serves one sequence, and a new link session forgets it. `0x000E` (can name an already-connected host) and control `0x06` (no address) are not used.
 
-the scoping rules are these.
+check 4 matches in two ways.
 
-- only the latest report counts. a later report without that host is no
-  evidence.
-- a report is used for one rejoin sequence at most.
-- a report is forgotten when a new link session starts, so a report from an
-  earlier session never qualifies a later drop.
-- audio-source and ownership reports are not used. `0x000E` can name a host that
-  was already connected, and control `0x06` carries no address.
+- **OUI.** first three octets registered to exactly `Apple, Inc.` (trimmed, ASCII case ignored). Macs and iPhones use their public BR/EDR address, which `0x002E` carries. the list comes from `/usr/share/hwdata/oui.txt` (`hwdata`), else `/usr/lib/udev/hwdb.d/20-OUI.hwdb` (systemd), else nine built-in OUIs copied from `oui.txt`, logged once as `Apple OUIs loaded count=... source=...`. a locally administered address (bit `0x02` of octet one) never matches.
+- **relay.** the host sent an `0x0011` relay here. up to 8 addresses persist in `$CACHE_DIRECTORY/apple_hosts.json` or `~/.cache/aurisd/apple_hosts.json`. covers Apple hosts behind a non-Apple OUI. not required.
 
-`rejoin scheduled` logs which condition matched, as `match_kind="joined"`,
-`match_kind="connected"` or `match_kind="link_lost"`.
+one bud charging in the case while the other is out is a bud swap and never blocks. `Trusted` only governs connections the AirPods start, and `bluetoothctl` or some panels leave it unset. nothing learned is needed for a first eviction. the OUI alone qualifies a host new to these AirPods or this host, AirPods paired a minute ago, and a missing or corrupt cache. the first `0x002E` on a link counts. a different AirPods address clears the report, ear state and eviction loop.
 
-**4. that listed host is an Apple host.** it is recognised in either of two ways.
+### bud swap
 
-- **OUI.** the first three octets of its address are registered to exactly
-  `Apple, Inc.`, trimmed and ASCII case ignored. Macs and iPhones use their
-  public BR/EDR address for classic bluetooth, and the `0x002E` list carries it.
-  at start the daemon reads `/usr/share/hwdata/oui.txt` (package `hwdata`), else
-  `/usr/lib/udev/hwdb.d/20-OUI.hwdb` (systemd), else a built-in list of nine
-  Apple OUIs copied from `oui.txt`. it logs
-  `Apple OUIs loaded count=... source=...` once. a locally administered address,
-  bit `0x02` of the first octet, never matches.
-- **relay.** the host has sent this one a smart-routing relay (`0x0011`). up to
-  8 addresses persist in `$CACHE_DIRECTORY/apple_hosts.json`, or
-  `~/.cache/aurisd/apple_hosts.json`. this covers an Apple host behind a
-  non-Apple OUI. it is not required.
+taking a bud out moves the radio link to the other bud, and an idle host's link may not survive. the AirPods can write it off in a report sent over it, then the drop is a `Timeout` while the owner keeps its link (`link_lost`), or sometimes `Remote` (`connected`). this host's own `info=00` is logged as `own_link_reported_down`, never required and never acted on. while bluez says connected, no report or ear change makes auris change state, send a packet or tear anything down.
 
-**5. the buds are not put away.** the last ear report did not show both buds in
-the case, and the lid is not known closed.
+### rate limit and the connect
 
-both buds in the case means put away. one bud in the case charging, while the
-other is in an ear or merely out of it, is a bud swap and never blocks a rejoin.
-the ear report carries a state per bud, `0x00` in ear, `0x01` out or `0x02` case.
-only `0x02` for both counts.
+one sequence starts per minute. an eviction inside the window is deferred to its end with the same evidence, sequence number and attempt budget, logged `rejoin deferred reason=rate_limited delay=...` (rest of window plus 3s). only the rate limit defers. the 20s loop check runs first.
 
-**6. the adapter and device are usable.** the adapter is powered, and the
-AirPods are paired and not blocked.
+the connect waits 3s, then re-checks powered, paired, not blocked and disconnected. the wait (ordinary or deferred) is cancelled by `Connected=true` from elsewhere, another `Disconnected`, both buds in the case, the adapter going away (object removed or `Adapter1.Powered=false`, not a watch ending), handoff off, or a connect command. link status reads `reconnecting` meanwhile. the wait and connect belong to the session task and survive a watcher rebuild. busy or in progress retries after 3s and 6s. any other error, a 30s timeout or a third busy stops with a warning. auris never calls `Disconnect`, even for a stuck `br-connection-busy`.
 
-`Trusted` is not required. pairing through `bluetoothctl` or some panels leaves
-it unset, and it only governs whether bluez accepts connections the AirPods
-start. auris starts this connect itself, to a device the user paired. `Blocked`
-still means never.
+a `Remote`/`Timeout` disconnect within 20s of a successful rejoin logs `eviction loop` and disables rejoin until a connect command or restart. the normal new-link path then reopens AAP, about 7s from drop to usable link.
 
-**7. no recent manual command.** no `auris reconnect` or `auris connect-once` in
-the last 10s.
+### device watch
 
-**8. no eviction loop.** a rejoin sequence started in the last 60s does not
-refuse the new one. it delays it, per the rate limit below.
-
-nothing learned is needed for the first eviction. all of these qualify on the
-OUI alone.
-
-- a Mac or iPhone that has never connected to these AirPods.
-- a Mac or iPhone that has never talked to this host.
-- AirPods paired a minute ago.
-- a missing or corrupt `apple_hosts.json`.
-- a missing cache directory.
-
-the first `0x002E` report on a link counts, and there is no baseline. a
-different AirPods address clears the old report, the ear state and any eviction
-loop from the previous device. the 60s rate limit and the 10s manual quiet
-period still apply.
-
-### the bud swap case
-
-taking a bud out moves the AirPods' radio link from the primary bud to the other
-one. an idle host's link does not always survive that move. the AirPods can
-write that host's own link off in a report which still arrives over that link.
-the drop then lands as a supervision `Timeout`, while the owning host keeps its
-link. the same swap sometimes lands as `Remote` instead. `link_lost` covers the
-first shape, `connected` the second.
-
-this host's own `info=00` in such a report is recorded as
-`own_link_reported_down` and logged. it is never required, because the report
-can predate the swap or be missing altogether. nothing acts on it.
-
-a report that marks this host's link down while bluez still says connected
-changes no state, sends no packet and tears nothing down. the same holds for
-every ear-detection change. bluez owns the link, and a link that still carries
-reports is not auris's to recycle.
-
-### the rate limit waits, it does not drop
-
-at most one rejoin sequence starts per minute. a qualifying eviction inside that
-window is scheduled for the moment the window expires, rather than dropped. it
-keeps the same evidence, sequence number and attempt budget. it is logged as
-`rejoin deferred reason=rate_limited delay=...`, where the delay is the rest of
-the window plus the usual 3s wait.
-
-only the rate limit defers. every other check refuses outright.
-
-a deferred connect is cancelled by exactly what cancels an ordinary one, namely a
-connect command, both buds going into the case, the adapter going away, or
-handoff being switched off. while it waits, the published link status stays
-`reconnecting`, as it does for any pending sequence.
-
-the 20s eviction loop is checked first and is unaffected. a second eviction
-within 20s of a successful rejoin stops rejoining altogether, rather than
-waiting a minute to page again.
-
-### the connect itself
-
-the connect waits 3s, then re-reads bluez and checks powered, paired, not blocked and still
-disconnected.
-
-the wait is cancelled by any of these.
-
-- `Connected=true` from anything else
-- another `Disconnected` signal
-- the adapter going away
-- handoff being switched off
-- a connect command
-
-"the adapter going away" means the adapter object removed, or
-`Adapter1.Powered=false`. a D-Bus watch that merely ended is not evidence of it
-and cancels nothing.
-
-the wait and the `Device1.Connect` call belong to the session task, not to the
-bluez watcher, so they survive a watcher rebuild. a connect refused as busy or
-in progress is tried again after 3s and then 6s, three calls in all. any other
-error, a 30s timeout, or a third busy refusal stops with a warning. auris never
-calls `Disconnect`, not even to clear a stuck `br-connection-busy`.
-
-a `Remote` or `Timeout` disconnect within 20s of a successful rejoin logs
-`eviction loop` and turns rejoin off, until a connect command or a daemon
-restart. a bud swap that keeps killing the new link therefore cannot loop.
-
-after the connect, the normal new-local-link path reopens AAP. the whole
-sequence from the drop to a usable link takes about seven seconds, made up of 3s of wait,
-then the page and profile setup.
-
-### the device watch ends at every disconnect
-
-bluez emits `InterfacesRemoved` for the device object when a profile interface
-such as `Battery1` or `MediaControl1` goes away at disconnect. `bluer` cancels
-the whole per-object subscription on that signal, even though `Device1` and the
-adapter remain.
-
-auris therefore reports the stream ending as a watch that ended, and reads
-`Adapter1.Powered` before claiming the adapter is gone. it rebuilds the watch
-2s later, without touching a scheduled rejoin, the evidence behind it, or
-handoff state. treating that signal as `AdapterGone` cancels a rejoin on a
-powered adapter, and leaves the AirPods on the other host until the user acts.
+bluez emits `InterfacesRemoved` when a profile interface such as `Battery1` or `MediaControl1` goes at disconnect, and `bluer` cancels the whole per-object subscription. auris treats it as an ended watch, reads `Adapter1.Powered` before calling the adapter gone, and rebuilds 2s later without touching a scheduled rejoin, its evidence or handoff state. treating it as `AdapterGone` would cancel rejoins on a powered adapter.
 
 ### logging
 
-every decision is logged at INFO as one of `rejoin scheduled`,
-`rejoin deferred reason=rate_limited delay=...`, `rejoin skipped reason=...` or
-`rejoin cancelled reason=...`.
+decisions log at INFO as `rejoin scheduled`, `rejoin deferred reason=rate_limited delay=...`, `rejoin skipped reason=...` or `rejoin cancelled reason=...`. skips are `no_recent_device_report_with_apple_host` (no report or no Apple host) and `no_apple_host_link_up` (Apple host listed, older than the window, link down).
 
-the skip reasons are these.
-
-- no report, or a report naming no Apple host, gives
-  `no_recent_device_report_with_apple_host`.
-- a report that names an Apple host but is older than the window and shows that
-  host's link down gives `no_apple_host_link_up`.
-
-every `Remote` and `Timeout` disconnect also logs, at INFO and before the
-decision, `disconnect: last AirPods connected-devices report`. it carries
-`reason`, `last_report_age_ms`, `apple_host_match` (`relay`, `oui` or `none`),
-`apple_host`, `apple_host_link_up`, `own_link_reported_down` and `listed_hosts`,
-every other host in that report. it logs even when rejoin is off.
-
-`rejoin scheduled` also carries `apple_host_match` and `match_kind`.
-`rejoin deferred` carries both of those and its `delay`. each `0x002E` report is
-logged at DEBUG with its header, and every address with its two info bytes, as in
-`devices=AC:DE:48:00:11:22 info=02 02, ...`.
+every `Remote`/`Timeout` disconnect logs `disconnect: last AirPods connected-devices report` at INFO before deciding, even with rejoin off, with `reason`, `last_report_age_ms`, `apple_host_match` (`relay`, `oui`, `none`), `apple_host`, `apple_host_link_up`, `own_link_reported_down` and `listed_hosts`. `rejoin scheduled` adds `apple_host_match` and `match_kind`, `rejoin deferred` those and `delay`. each `0x002E` logs at DEBUG with header and per-address info bytes, as `devices=AC:DE:48:00:11:22 info=02 02, ...`.
 
 ## the pipewire audio route
 
-while handoff is enabled, auris owns the pipewire bluez card profile,
-`bluez_card.<addr>`, and sets it as follows.
+with handoff enabled auris sets the card `bluez_card.<addr>` to `off` whenever this host does not own the AirPods, and back to the A2DP profile in use (normally `a2dp-sink`) when it owns or is taking over. the card comes from `pw-dump` and the profile is set with `pw-cli set-param <id> Profile '{ index: N }'` without `save`, so wireplumber never persists `off`. it runs on control `0x06`, at take-over start before AAP writes, on yield, and (restoring A2DP) when handoff turns off or the daemon stops. a disconnect touches nothing.
 
-- `off` whenever this host does not own the AirPods
-- back to the A2DP profile that was in use, normally `a2dp-sink`, when this host
-  owns them or is taking over
+a yield runs in order, so playback stops instead of moving sink and ownership is never released over an open transport.
 
-the card is found with `pw-dump`. the profile is set with
-`pw-cli set-param <id> Profile '{ index: N }'`, with no `save` field.
-wireplumber therefore never persists `off` as the user's chosen profile.
+1. pause MPRIS players.
+2. drain until none is Playing, at most 600ms.
+3. set the profile `off`, releasing the transport from this side.
+4. wait for the switch, at most 2s.
+5. send the ownership release.
 
-the change runs at four points.
-
-- on an AirPods ownership report, control `0x06`
-- at the start of a take-over, before the AAP writes
-- on a yield, in the ordered sequence below
-- once more, restoring A2DP, when handoff is turned off or the daemon stops
-
-a disconnect touches nothing, because the card disappears with the link.
-
-### the ordered yield sequence
-
-a yield runs five steps in order.
-
-1. pause local MPRIS players.
-2. drain, waiting until no player reports Playing. the wait is bounded by a 600ms
-   timeout, after which the sequence proceeds anyway.
-3. set the card profile to `off`. that releases the A2DP transport from this
-   side.
-4. wait for the profile switch to land, bounded by a 2s timeout.
-5. send the ownership release on the AAP link.
-
-the order is what the sequence is for. local playback stops rather than being
-re-routed to another sink, and ownership is never released while a transport is
-still open underneath this host.
-
-both waits are upper bounds. a quiet graph reaches step 5 as soon as the pause
-and the profile switch have taken effect.
-
-releasing the transport from this side also keeps the local node healthy. when
-the AirPods tear down the transport under a running pipewire node, that node
-goes to error, as this log line shows.
+both waits are upper bounds. a node whose transport the AirPods tear down while running goes to error and never recovers, so releasing first means the next take-over gets a fresh node.
 
 ```
 pw.node: (bluez_output.BC_80_4E_01_02_03.1-37) running -> error (Received error event)
 ```
 
-the node never recovers on its own. closing the transport before ownership is
-released avoids the error entirely, and a fresh node is created on the next
-take-over instead of a failed one being reused.
-
-the AirPods sink stays the configured default sink, priority 1010, so pipewire
-moves streams back to it on its own once the node returns.
-
-routing by ownership keeps the local audio graph in agreement with who holds the
-AirPods, and removes the failure where this host owns them but stays silent. its
-behaviour against a call on the other host is not established.
+the AirPods sink stays the default (priority 1010), so pipewire moves streams back when the node returns. this removes the owning-but-silent failure. behaviour against a call on the other host is not established.
 
 ## in-ear media control
 
-the accessory's ear report carries a state per bud, `0x00` in ear, `0x01` out or
-`0x02` case. a bud entering the case counts as leaving an ear. auris acts on
-those reports over MPRIS.
+ear states per bud are `0x00` in ear, `0x01` out, `0x02` case (case counts as out). a change must hold 700ms, absorbing case-open and primary-switch flaps. by default one of two in-ear buds leaving pauses local players, as macOS does. `pause_on_one_of_two = false` waits for the last bud. `auto_pause` and `auto_resume` gate each half. a resume fires once on the settled return when auris made the pause, the in-ear count is back to at least what was lost, within 5min, with no user play or pause between, and audio is on the AirPods (link up, card not yielded, this host owner).
 
-a changed reading must hold for 700ms before anything is sent. that absorbs the
-flap bursts a case opening or a primary bud role switch produces.
+## limits and evidence
 
-**pause.** a bud leaving an ear pauses local players. the default rule pauses as
-soon as one of two in-ear buds leaves, which is what macOS does.
-`pause_on_one_of_two = false` narrows the rule to the last bud, so playback
-continues while either bud is still in an ear.
+- linux's outbound L2CAP connect can establish an ACL, so the fresh bluez check is a mitigation, not an atomic guarantee.
+- bluez `Connected` is **local**. RSSI, availability and silence cannot prove another host is disconnected.
+- other software or bluez policy can start a connection.
+- auris cannot mute an iPhone or Mac that loses its audio route.
+- an adapter power cycle inside the 3s rejoin wait is caught only by its `Disconnected` signal and the pre-connect re-read.
+- with an Apple host listed link-up, an eviction cannot be told from another AirPods-initiated drop. the case, lid, rate, manual and loop checks bound it.
+- an Apple host on a random or locally administered address misses the OUI rule. a non-Apple OS on Apple hardware matches it.
+- Magic Pairing (link keys shared through the iCloud Keychain) is out of reach. linux pairs on its own and joins only through AAP ownership. a Mac or iPhone may still claim the AirPods for a call or by its own heuristics, and auris yields.
 
-**resume.** a resume needs every one of these.
-
-- auris made the pause.
-- the in-ear count is back to at least the count that was lost.
-- the return lands within a 5 minute window.
-- no user play or pause happened in between.
-- audio is actually on the AirPods, meaning the link is up, the card is not yielded, and
-  handoff reports this host as owner.
-
-it fires at most once, on the settled return.
-
-config lives under `[ear]`.
-
-| key | default | effect |
-|---|---|---|
-| `auto_pause` | true | pause local players when a bud leaves an ear |
-| `auto_resume` | true | resume after a qualifying return |
-| `pause_on_one_of_two` | true | pause on the first of two buds leaving, rather than the last |
-
-the resume conditions are what keep the feature from fighting the user or the
-other host. a pause auris did not make is never undone, and a resume never
-starts audio that would land on a host which does not own the AirPods.
-
-## safety limits and failure modes
-
-### what the guards cannot promise
-
-- linux's outbound L2CAP connect can establish an ACL, so a fresh bluez check is
-  a mitigation, not an atomic ownership guarantee.
-- bluez's `Connected` describes the **local** connection. RSSI, availability and
-  silence cannot prove another host is disconnected.
-- other software, or bluez policy, can also start a connection.
-- auris cannot mute an iPhone or a Mac when those devices lose their audio
-  route.
-- an adapter power cycle inside the 3s rejoin wait is caught only through its
-  own `Disconnected` signal and the re-read before connecting.
-- the rejoin rules cannot tell an eviction from any other AirPods-initiated drop
-  while an Apple host is listed with its link up. the case, lid, rate-limit,
-  manual-command and eviction-loop checks are what bound that.
-- an Apple host using a random or locally administered address does not match
-  the OUI rule. a non-Apple host on Apple hardware, such as another linux
-  machine on a Mac, does match it.
-
-see [bluez Device1](https://bluez.readthedocs.io/en/latest/device-api/) and the
-[linux L2CAP connection
-path](https://github.com/torvalds/linux/blob/master/net/bluetooth/l2cap_core.c).
-
-### magic pairing
-
-Magic Pairing proper is out of reach on linux. it is the mechanism where every
-device on one Apple ID shares the AirPods link keys through iCloud, so the
-AirPods connect to a Mac without pairing. those keys live in the iCloud
-Keychain, and linux has no way to obtain or publish them.
-
-the linux host is paired on its own, and joins the handoff only through the AAP
-ownership messages above. an Apple host keeps its own policy either way. a Mac
-or an iPhone may still claim the AirPods for a call, or when its own heuristics
-decide to, and auris yields when that happens.
-
-### confidence in each part
+see [bluez Device1](https://bluez.readthedocs.io/en/latest/device-api/) and the [linux L2CAP connection path](https://github.com/torvalds/linux/blob/master/net/bluetooth/l2cap_core.c).
 
 | behaviour | basis |
 |---|---|
-| `0x000E`, `0x002E`, `0x0011` layouts, control `0x06` meaning | cross-checked against LibrePods parsers (`AACPManager.kt`), named the same way by the apple-wireshark AACP dissector, and matched by this device's own reports |
-| `0x000C` address + 2 bytes | layout confirmed against the dissector, but the two bytes are unexplained |
-| `0x002E` info byte 0 meanings | read from reports correlated with an Apple host's own connection log |
-| `0x002E` info byte 1, second header byte | unexplained and not read |
+| `0x000E`, `0x002E`, `0x0011` layouts, control `0x06` | LibrePods parsers (`AACPManager.kt`), same names in the apple-wireshark AACP dissector, matched by this device's reports |
+| `0x000C` address + 2 bytes | layout per the dissector, bytes unexplained |
+| `0x002E` byte 0 | reports correlated with an Apple host's connection log |
+| `0x002E` byte 1, second header byte | unexplained, not read |
 | `Hijackv2` body | byte-for-byte equal to LibrePods' recorded iPhone encoding |
-| `newTipi` and new-device media information | byte-for-byte equal to LibrePods' encoders, with `btName` substituted |
-| streaming media information | LibrePods' key and value sequence, re-encoded as valid OPACK. LibrePods omits the `btName` key tag, tags `YES` as a two-byte string and zero-pads to a fixed buffer. unconfirmed against an Apple host |
-| yield on another host's audio source, ownership `00` or a relayed request, and the take-over sequence | confirmed in LibrePods code (`AirPodsService.kt`, `MediaController.kt`), and exercised against a Mac |
-| hold windows (2.5s and 2.5s), 1.5s debounce, no take-over from a call, profiles kept connected on yield | auris policy, replayed in `handoff.rs` tests. keeping profiles connected is not confirmed against an Apple host |
-| opening window (3s or the settings dump, at most 10s) | auris policy, from an opening dump that named an idle Mac as media source |
-| one re-pause per player per request, and hold ending 10s after the latest request | auris policy, so a deliberate local play is never blocked |
-| `btName = Mac` accepted by a Mac's ownership check | confirmed. `_shouldAllowRelinquishOwnership _myModel Mac otherTipiName Mac` answers `YES`, as does `otherTipiName iPhone` |
-| `btName = Mac` producing a Mac-style banner on Apple hosts | speculative |
-| `HostStreamingState` timing rules | auris policy, replayed in `handoff.rs` |
-| audio route following ownership, with pause, drain, profile `off`, then ownership release | auris policy. the 600ms drain and the 2s profile-switch wait are upper bounds |
-| media information sent to every other listed host | auris policy. LibrePods sends to the first host only |
+| `newTipi`, new-device media information | byte-for-byte equal to LibrePods' encoders, `btName` substituted |
+| streaming media information | LibrePods' keys and values re-encoded as valid OPACK (LibrePods omits the `btName` key tag, tags `YES` as a two-byte string, zero-pads a fixed buffer). unconfirmed against an Apple host |
+| yield triggers and take-over sequence | LibrePods code (`AirPodsService.kt`, `MediaController.kt`), exercised against a Mac |
+| 2.5s hold windows, 1.5s debounce, no take-over from a call, profiles kept on yield | auris policy, replayed in `handoff.rs` tests. kept profiles unconfirmed against an Apple host |
+| opening window (3s or dump, at most 10s) | auris policy, from a dump that named an idle Mac as media source |
+| one re-pause per request, hold end 10s after request | auris policy, so a deliberate play is never blocked |
+| `btName = Mac` accepted | confirmed by the Mac's `_shouldAllowRelinquishOwnership` answering `YES` for `Mac` and `iPhone` |
+| `btName = Mac` giving a Mac-style banner | speculative |
+| `HostStreamingState` timing | auris policy, replayed in `handoff.rs` |
+| audio route order (pause, drain, `off`, release) | auris policy. 600ms and 2s are upper bounds |
+| media information to every listed host | auris policy. LibrePods sends to the first only |
 
-### not yet exercised
-
-- the `connected` and `link_lost` rejoin rules are derived from observed drops.
-  neither has fired on hardware on its own.
-- the OUI path has not fired on hardware. an Apple host seen for the first time
-  has not been captured evicting this one.
-- the audio route change has not been exercised against a call on the other
-  host, nor against the stalled-stream case the MPRIS nudge failed on.
-- whether an Apple host keeps the AirPods while this host's A2DP stays connected
-  but idle is not established.
-- whether pipewire's idle transport suspend or resume produces new audio-source
-  reports is not established.
+these are not yet exercised on hardware. `connected` and `link_lost` (derived from observed drops, never fired alone), the OUI path (no first-seen Apple host captured evicting this one), the audio route against a call on the other host or the stalled stream the MPRIS nudge failed on, whether an Apple host keeps the AirPods while this host's A2DP is connected but idle, and whether pipewire idle suspend or resume produces audio-source reports.

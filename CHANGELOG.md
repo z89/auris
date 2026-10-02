@@ -2,6 +2,7 @@
 
 ## unreleased, AirPods 4 ANC settings
 
+- the bar pill text follows the DMS bar font scale instead of a fixed size.
 - auto-connect now handles an adapter with LE off. with `ControllerMode =
   bredr` in bluez the advert scan can never start, so the daemon logs one
   warning where it used to retry every 5s, waits for the adapter to change

@@ -6,27 +6,23 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8fd3ff?style=flat-square&labelColor=1b1a20" alt="license MIT"></a>
 </p>
 
-auris brings AirPods features from Apple devices to linux. that covers battery for each bud and the case, noise control and the other AirPods settings, pausing and resuming playback when a bud leaves or enters an ear, and handing the AirPods back and forth with a Mac, iPhone or iPad. it runs as a rootless user service on stock bluez and pipewire, with a command line tool, a JSON state file and an optional [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) (DMS) panel.
+auris brings the AirPods features of an Apple device to linux. it shows the battery for each bud and the case, switches noise control and changes the other AirPods settings, including press speed, hold duration, call controls and personalized volume. taking a bud out pauses playback and putting it back resumes it, and opening the case is enough to connect. it runs as a rootless user service on stock bluez and pipewire, with no kernel patch, no forked bluetooth stack and nothing running as root.
 
-`aurisd` is a rust daemon that speaks the Apple Accessory Protocol (AAP) to AirPods over the L2CAP control channel on PSM 0x1001, the channel Apple's own hosts use. it completes the Apple handshake, subscribes to the accessory's notifications and decodes them. they carry battery per bud and case, in-ear state, noise-control mode and adaptive level, conversational awareness, device metadata and firmware, and the multi-host ownership and smart-routing messages the AirPods relay between hosts.
+the `aurisd` daemon speaks the Apple Accessory Protocol (AAP) over the same control channel Apple's own devices use, so the AirPods treat this machine as another Apple host. when a Mac, iPhone or iPad takes the AirPods over, auris pauses and steps aside, and pressing play here brings the audio back without dropping the connection. each setting counts as applied only once the AirPods report it back, and the link recovers by itself after another host evicts it or the connection drops. a command line tool, a JSON state file and an optional [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) (DMS) panel all read the same live state.
 
-with Apple's bluetooth vendor id presented by bluez, the AirPods treat this machine as an Apple host and run the same proximity-pairing ownership exchange they run with a Mac or an iPhone. auris takes part in that exchange rather than imitating it. a claim from another host is answered by stopping local playback and releasing this side of the A2DP transport before ownership moves. a local play edge sends the take-over request and pulls the stream back. the ACL link and both audio profiles stay connected across a switch, so the cost is a profile change rather than a disconnect, a page and a re-pair.
-
-the rest of the daemon is built on the same reports. in-ear transitions drive local players over MPRIS, so a bud out of the ear pauses and a bud back in resumes. a setting write is not treated as a result. the value is read back from the accessory's own report before the CLI or the panel calls it confirmed. the link repairs itself after an eviction by another host, a primary-bud role switch or a dropped ACL, and opening the case is enough to connect, from the proximity advertisement rather than from a scan.
-
-there is no kernel patch, no forked bluetooth stack, no root and no vendor daemon. one snapshot is published as line-delimited JSON on a unix socket and as an atomic state file, so the CLI, the live panel and anything else read identical state.
+auris is its own project rather than part of [LibrePods](https://github.com/librepods-org/librepods), which mapped much of the same protocol and also covers Android. on linux LibrePods is a desktop app with a tray icon. its state lives inside that app, a setting counts as applied as soon as it is sent, playing media is found by checking every player twice a second, and a missing audio profile is fixed by restarting wireplumber. auris runs as a background service that other tools can read, waits for the AirPods to confirm each change, follows players as they change and never restarts wireplumber. those differences go deeper than a patch, and keeping auris MIT licensed means it builds on the protocol findings without using any of LibrePods' GPL code.
 
 > tested on arch linux with bluez 5.87, pipewire 1.6.8 and wireplumber, against AirPods 4 (ANC), model id `0x201B`, with a Mac on macOS Tahoe 26.6.2 as the second host. other AirPods models, other bluez versions and other distributions are untested.
 
 ## ✨ highlights
 
-- 🔄 **multi-host handoff** yields to a Mac, iPhone or iPad on its ownership claim and takes the AirPods back on a local play edge, over the accessory's control channel, with both profiles left up.
-- 👂 **in-ear control** pauses local players when a bud comes out and resumes what auris paused when it goes back in, driven by the accessory's own in-ear reports.
-- 🩹 **a self-healing link** classifies evictions, primary-bud role switches and dropped links from bluetooth events, recovers each once, and never redials a disconnect you made yourself.
-- 📦 **auto-connect on case open** follows the case's BLE proximity advertisement, which needs LE enabled on the adapter, with a paging path for adapters that miss the advert.
-- ✅ **verified settings** for noise control, conversational awareness, adaptive level, press speed, hold duration, call controls, personalized volume and rename are confirmed from the accessory's own report. microphone side and the listening-mode cycle are sent but carry no confirming report on this firmware.
-- 🧰 **a CLI and plain JSON**, with `auris` driving every control from a shell and `state.json` plus the control socket exposing the whole snapshot to other tools.
-- 🎛️ **a live panel** for DMS is an optional frontend for the same socket, pushed from the daemon rather than polled.
+- 🔄 **multi-host handoff** gives the AirPods up when a Mac, iPhone or iPad claims them and takes them back when something plays here, with the connection left up.
+- 👂 **in-ear control** pauses local players when a bud comes out and resumes them when it goes back in.
+- 🩹 **a self-healing link** recovers once from an eviction, a bud role switch or a dropped link, and never redials a disconnect you made yourself.
+- 📦 **auto-connect on case open** follows the case's BLE advert, with a paging fallback for adapters that miss it.
+- ✅ **confirmed settings** are only reported as applied once the AirPods report the new value. microphone side and the listening-mode cycle get no report on this firmware, so the CLI and the panel label them unconfirmed rather than failed.
+- 🧰 **a CLI and plain JSON** expose every control from a shell, with `state.json` and the control socket carrying the full snapshot for other tools.
+- 🎛️ **a live panel** for DMS reads the same socket and updates as the daemon pushes changes.
 
 ## 📦 install
 
@@ -45,7 +41,7 @@ that is the whole install. `auris status` should print the accessory within a fe
 ## 📊 feature matrix
 
 rows are checked against [LibrePods' latest README](https://github.com/librepods-org/librepods/blob/main/README.md).
-the annotated version is in [feature comparison](docs/FEATURE_COMPARISON.md).
+the annotated version is in [features](docs/FEATURES.md).
 
 | symbol | meaning |
 | ------ | ------- |
@@ -57,45 +53,43 @@ the annotated version is in [feature comparison](docs/FEATURE_COMPARISON.md).
 
 | feature | LibrePods (linux) | auris | note |
 |---|---|---|---|
-| Changing Listening Mode | ✅ | ✅ | off, ANC, transparency, adaptive |
-| Ear detection | ✅ | ✅ | live left and right state in daemon, CLI and UI |
-| Battery status | ✅ | ✅ | per bud and case, charging, freshness, last-known cache |
-| Renaming AirPods | ✅ | ✅ | read back from the accessory's own metadata |
-| Loud Sound Reduction | 🔴 | 🔴 | neither side has it on linux |
-| Head Gestures | ⛔ | ⛔ | no linux path, same reason LibrePods gives |
-| Conversational Awareness | ✅ | ✅ | control plus the 0x004B event |
-| Automatically connect to AirPods | ✅ | ✅ | pages over BLE on case opening, on by default, needs LE on the adapter |
-| Hearing Aid | 🔴 | 🔴 | neither side has it on linux |
-| Transparency Mode customization | 🔴 | 🔴 | adaptive strength only, not the full set |
-| Multi-device connectivity (Bluetooth Multipoint, 2 devices only) | ⚪ | ⚪ | two live hosts with ownership handoff, after an Apple `DeviceID` in bluez and one re-pair |
-| Other accessibility configs | 🔴 | see rows below | LibrePods ships these on android only |
-| ... Press speed | 🔴 | ✅ | auris only on linux, physical timing not accepted yet |
-| ... Press and Hold duration | 🔴 | ✅ | auris only on linux, physical timing not accepted yet |
-| ... Noise Cancellation with single AirPod | 🔴 | 🔴 | no verified public command, see [per-bud control](docs/PER_BUD_CONTROL_RESEARCH.md) |
-| ... Volume control on swipe | 🔴 | 🔴 | neither side has it on linux |
-| ... Volume swipe speed | 🔴 | 🔴 | neither side has it on linux |
-| Other general configs | 🔴 | see rows below | LibrePods ships these on android only |
-| ... Press and Hold to cycle between listening modes / invoke digital assistant (invoking digital assistant needs a recent firmware) | 🔴 | ❓ | cycle is sent, no device report confirms it |
-| ... Configure call controls | 🔴 | ✅ | auris only on linux, call behaviour not accepted yet |
-| ... Personalized volume | 🔴 | ✅ | auris only on linux, audio effect not accepted yet |
-| ... Loud Sound Reduction (needs VendorID spoofing) | 🔴 | 🔴 | neither side has it on linux |
-| ... Microphone side | 🔴 | ❓ | sent, no device report confirms it |
-| ... Pause media when falling asleep (needs a recent firmware) | 🔴 | 🔴 | neither side has it on linux |
-| ... Enable `Off listening mode` to switch to `Off` | 🔴 | ✅ | off is one of the four selectable modes |
-| Head-tracked Spatial Audio | ❓ | 🔴 | needs audio-stack work beyond this project |
+| Changing Listening Mode | ✅ | ✅ | off, ANC, transparency and adaptive |
+| Ear detection | ✅ | ✅ | shows whether each bud is in an ear, in the daemon, CLI and panel |
+| Battery status | ✅ | ✅ | each bud and the case, with charging state. old readings are kept and marked stale |
+| Renaming AirPods | ✅ | ✅ | the new name is read back from the AirPods to confirm it |
+| Loud Sound Reduction | 🔴 | 🔴 | neither project has it on linux |
+| Head Gestures | ⛔ | ⛔ | not possible on linux, for the same reason LibrePods gives |
+| Conversational Awareness | ✅ | ✅ | turns it on and off, and reports when the AirPods lower the volume while you speak |
+| Automatically connect to AirPods | ✅ | ✅ | connects when the case opens, on by default, needs LE enabled on the bluetooth adapter |
+| Hearing Aid | 🔴 | 🔴 | neither project has it on linux |
+| Transparency Mode customization | 🔴 | 🔴 | only the adaptive strength can be set, not the full set of transparency options |
+| Multi-device connectivity (Bluetooth Multipoint; 2 devices only) | ⚪ | ⚪ | both hosts stay connected and pass the AirPods back and forth, after setting an Apple `DeviceID` in bluez and pairing again |
+| Other accessibility configs | 🔴 | see rows below | LibrePods has these on Android only |
+| ... Press speed | 🔴 | ✅ | only auris has it on linux. the AirPods confirm the new setting, but nobody has checked yet that presses feel different |
+| ... Press and Hold duration | 🔴 | ✅ | only auris has it on linux. the AirPods confirm the new setting, but nobody has checked yet that holds feel different |
+| ... Noise Cancellation with single AirPod | 🔴 | 🔴 | no known command turns it on, see [per-bud control](docs/RESEARCH.md#per-bud-control) |
+| ... Volume control on swipe | 🔴 | 🔴 | neither project has it on linux |
+| ... Volume swipe speed | 🔴 | 🔴 | neither project has it on linux |
+| Other general configs | 🔴 | see rows below | LibrePods has these on Android only |
+| ... Press and Hold to cycle between listening modes / invoke digital assistant (invoking digital assistant needs a recent firmware) | 🔴 | ❓ | auris sends the setting, but the AirPods never confirm it |
+| ... Configure call controls | 🔴 | ✅ | only auris has it on linux. the AirPods confirm the new setting, but nobody has checked yet that calls behave differently |
+| ... Personalized volume | 🔴 | ✅ | only auris has it on linux. the AirPods confirm the new setting, but nobody has checked yet that you can hear the difference |
+| ... Loud Sound Reduction (needs VendorID spoofing) | 🔴 | 🔴 | neither project has it on linux |
+| ... Microphone side | 🔴 | ❓ | auris sends the setting, but the AirPods never confirm it |
+| ... Pause media when falling asleep (needs a recent firmware) | 🔴 | 🔴 | neither project has it on linux |
+| ... Enable `Off listening mode` to switch to `Off` | 🔴 | ✅ | off is one of the four modes you can pick |
+| Head-tracked Spatial Audio | ❓ | 🔴 | needs work in the linux audio stack, outside this project |
 | Heart Rate Monitoring | ⛔ | ⛔ | AirPods 4 (ANC) has no heart rate sensor |
-| Find My | ❓ | 🔴 | needs protocol and security work beyond this project |
-| High quality two-way audio | 🔴 | 🔴 | neither side has it on linux |
-| Auto play/pause on ear detection | ✅ | ✅ | a bud out of the ear pauses local players, a bud back in resumes |
-| Seamless handoff between hosts | ✅ | ✅ | ownership exchange over the accessory's control channel |
+| Find My | ❓ | 🔴 | needs protocol and security work outside this project |
+| High quality two-way audio | 🔴 | 🔴 | neither project has it on linux |
+| Auto play/pause on ear detection | ✅ | ✅ | taking a bud out pauses local players and putting it back in resumes them |
+| Seamless handoff between hosts | ✅ | ✅ | the AirPods pass between hosts the same way they do between Apple devices, tested against a Mac |
 
 ## 🔄 multi-host handoff
 
-handoff is opt-in and works with any Mac, iPhone or iPad paired to the same AirPods.
+handoff is opt-in and works with any Mac, iPhone or iPad paired to the same AirPods. Apple devices only pass the AirPods to a host that reports Apple's bluetooth vendor id, so bluez needs that id set once and the AirPods need pairing again.
 
 <p align="center"><img src="docs/img/handoff.svg" alt="handoff flow" width="1000"></p>
-
-Apple hosts only exchange ownership with a peer that presents Apple's bluetooth vendor id, so bluez needs that id set once, and the AirPods need pairing again afterwards.
 
 ```sh
 sudo sed -i 's/^#ReconnectAttempts=7/ReconnectAttempts=0/' /etc/bluetooth/main.conf
@@ -105,27 +99,19 @@ bluetoothctl remove <airpods address>   # then pair again
 auris handoff on
 ```
 
-with that in place the exchange runs over the accessory, in a fixed order. a claim from another host pauses the local players, waits for the stream to actually stop, sets the AirPods' pipewire card profile to `off` so the A2DP transport is released from this side, and only then sends the ownership release. playback ends rather than being handed to another sink, and the accessory is never given up while a transport is still open under it. a player that resumes itself during the hold is paused again, so an autoplaying tab cannot drag the audio back. when something plays here and the other host is not on a call, auris sends the claim and the stream returns. the ACL link and both profiles stay connected the whole time.
+when another device takes the AirPods, auris pauses playback, lets go of the audio and then hands them over. pressing play here takes them back, unless the other device is on a call. the bluetooth connection stays up throughout, so a switch never needs a reconnect.
 
-`auris handoff status` reports who owns the accessory and where audio is routed. `auris take-over` and `auris yield` force either direction. setting `take_over_on_play = false` under `[handoff]` in `~/.config/aurisd/config.toml` keeps the automatic yield and leaves the claim manual. `bt_name` in the same section is the name the Mac shows in its banner when it loses the AirPods.
-
-the protocol itself, the opcodes and the observed behaviour of each host are in [Apple multi-host switching](docs/BATTERY_AND_HANDOFF.md#apple-multi-host-switching).
+`auris handoff status` shows which device has the AirPods, and `auris take-over` and `auris yield` switch by hand. the protocol is described in [Apple multi-host switching](docs/BATTERY_AND_HANDOFF.md#apple-multi-host-switching).
 
 ## 👂 in-ear control
 
-the accessory reports in-ear state per bud, and auris acts on it over MPRIS. taking a bud out pauses every local player that is playing, and putting it back in resumes the player auris paused. a pause you made yourself is never undone, nothing resumes while another host owns the AirPods, and transient reports during a case open or a bud role switch are settled before anything is sent.
+taking a bud out pauses whatever is playing, and putting it back in resumes it. a pause you made yourself is never undone, and nothing resumes while another device has the AirPods.
 
-three keys under `[ear]` in `~/.config/aurisd/config.toml` control it. they are `auto_pause`, `auto_resume` and `pause_on_one_of_two`, which decides whether removing one bud of a pair pauses immediately, as macOS does, or whether the pause waits for the second bud. all three default to on.
+`auto_pause`, `auto_resume` and `pause_on_one_of_two` under `[ear]` in `~/.config/aurisd/config.toml` switch each part off. the last one makes a single bud out enough to pause, as macOS does. all three are on by default, and the [daemon readme](daemon/README.md) covers every key, including `take_over_on_play` and `bt_name` for handoff.
 
 ## 🎛️ live panel
 
-the panel is a DMS plugin and is optional, since auris is complete from the CLI. it subscribes to the daemon's socket, so it reflects battery, ear state and link changes as they arrive.
-
-<p align="center">
-  <img src="docs/img/pill.png" alt="bar pill" height="72">
-  &nbsp;&nbsp;&nbsp;
-  <img src="docs/img/panel.png" alt="panel" height="360">
-</p>
+the panel is an optional DMS plugin. it reads the daemon's live state, so it updates the moment the AirPods report a change.
 
 ```sh
 git clone https://github.com/z89/auris ~/.config/DankMaterialShell/plugins/auris
@@ -134,15 +120,11 @@ dms ipc call plugins enable auris
 
 add `auris` to a bar under settings, bar, widgets. no shell restart is needed.
 
-- the pill shows battery and hides charging buds from its figure, since a charging level says nothing about what is in your ears. left click opens the panel, right click toggles ANC and transparency.
-- the panel carries left, right and case levels, the listening modes with the adaptive slider, conversational awareness, and a setup section behind the chevron for renaming, microphone side, press speed, hold duration, the mode cycle, call controls and personalized volume.
-- readings that stop arriving are kept and marked stale rather than dropped, and historical charging is never shown as a live measurement.
-- while a link is healing the widget stays on the bar with dimmed readings and an attempt count. any other disconnect is held briefly so a quick rejoin does not blink the module out.
-- plugin options under settings, plugins, auris cover the percentage on the pill, which cells the pill summarises, the low and critical thresholds, and whether the module hides when the AirPods are away.
+the bar pill shows the battery level, leaving out any bud that is charging. left click opens the panel and right click toggles ANC and transparency. the panel holds the battery for each bud and the case, the listening modes, conversational awareness and every AirPods setting. readings that stop updating stay visible and are marked stale, and the pill stays on the bar while the AirPods reconnect. what the pill shows and its battery warning levels are set under settings, plugins, auris.
 
 ## 🖥️ cli reference
 
-`auris` talks to the daemon over the control socket and exits non-zero when the daemon is unreachable or the accessory rejects a command.
+`auris` talks to the daemon over the control socket and exits non-zero when the daemon is unreachable or the AirPods reject a command.
 
 | command | arguments | what it does |
 |---|---|---|
@@ -151,32 +133,14 @@ add `auris` to a bar under settings, bar, widgets. no shell restart is needed.
 | `auris ca` | `on`, `off` | conversational awareness |
 | `auris adaptive` | `0`-`100` | adaptive transparency strength |
 | `auris setting` | `<key> <json-value>` | any typed setting, for example `auris setting microphone '"left"'` |
-| `auris rename` | `<name>` | rename the accessory, then confirm from its metadata |
+| `auris rename` | `<name>` | rename the AirPods, then confirm from their metadata |
 | `auris handoff` | `on`, `off`, `status` | multi-host switching |
 | `auris take-over` | | claim the AirPods from another Apple host now |
 | `auris yield` | | give them up to another Apple host now |
 | `auris reconnect` | | drop and re-establish the AAP control link only |
 | `auris connect-once` | | ask bluez once to connect the pinned device, never retried automatically |
 
-`--runtime-dir <PATH>` is global and overrides `$XDG_RUNTIME_DIR/aurisd`. `-h` and `-V` behave as usual.
-
-the daemon takes three flags.
-
-| flag | what it does |
-|---|---|
-| `--runtime-dir <PATH>` | override the runtime directory |
-| `--device <BD_ADDR>` | pin to one accessory instead of auto-detecting |
-| `--dump-schema` | print an example `state.json` and exit |
-
-the rest lives in `~/.config/aurisd/config.toml`, with the pinned device, the primary bud and the `[handoff]`, `[autoconnect]`, `[ear]` and `[ble]` sections. every key and default is documented in the [daemon readme](daemon/README.md).
-
-## ⚙️ settings and verification
-
-writes go out as AAP control commands and are judged by what comes back.
-
-- the accessory's report confirms noise control, conversational awareness, adaptive level, press speed, hold duration, call controls, personalized volume and rename, which is read back from the device metadata after the link reopens.
-- microphone side and the listening-mode cycle are sent but unconfirmed on this firmware. the CLI and the panel label them unconfirmed rather than failed.
-- the audible effect of a setting is a separate question from the write path. the write path is what auris can prove.
+`--runtime-dir <PATH>` overrides `$XDG_RUNTIME_DIR/aurisd` for both `auris` and `aurisd`. the daemon also takes `--device <BD_ADDR>` to pin one accessory and `--dump-schema` to print an example `state.json`. everything else lives in `~/.config/aurisd/config.toml`, documented key by key in the [daemon readme](daemon/README.md).
 
 ## ✅ requirements
 
@@ -187,43 +151,40 @@ writes go out as AAP control commands and are judged by what comes back.
 
 ## 🩺 troubleshooting
 
-if the CLI or the panel reports the daemon missing, check `systemctl --user status aurisd`. a cargo install lands in `~/.cargo/bin`, and the plugin also looks in `~/.local/bin`.
+| symptom | fix |
+|---|---|
+| CLI or panel says the daemon is missing | check `systemctl --user status aurisd`. cargo installs to `~/.cargo/bin`, and the plugin also looks in `~/.local/bin` |
+| AirPods connected but nothing reports | give the daemon a few seconds after the link comes up, then read `journalctl --user -u aurisd` |
+| handoff does nothing | check the `DeviceID` line in `/etc/bluetooth/main.conf` and that the AirPods were paired again after adding it |
+| no connect when the case opens | if `auris status` says LE is off, bluez runs with `ControllerMode = bredr`. set it to `dual` (or remove it) and run `sudo systemctl restart bluetooth`. aurisd restarts the scan by itself. while LE is off only the page fallback connects, and only in the first 10min after a drop |
 
-if the AirPods are connected but nothing reports, give the daemon a few seconds after the bluetooth link comes up, then read `journalctl --user -u aurisd`, which logs what the accessory answered.
-
-if handoff does nothing, confirm the `DeviceID` line is in `/etc/bluetooth/main.conf` and that the AirPods were paired again after it was added. without it the AirPods will not exchange ownership with this host.
-
-if the AirPods do not connect when the case opens, run `auris status`. a last line saying bluetooth LE is off on the adapter means bluez runs with `ControllerMode = bredr` in `/etc/bluetooth/main.conf`, so the advert scan cannot start. set `ControllerMode = dual` (or remove the line) and run `sudo systemctl restart bluetooth`. aurisd notices the adapter coming back and starts the scan without a restart of its own. while LE is off, only the page fallback connects, and only in the first 10min after a drop.
-
-on one adapter (a MediaTek MT7925 with bluez 5.87) pairing the AirPods hung in the default dual mode and completed with `ControllerMode = bredr`. set `bredr` only while pairing, then set it back to `dual` and restart bluetooth so case-open auto-connect works again. on that card dual mode connects normally once the AirPods are paired, and the advert trigger was checked there.
+on a MediaTek MT7925 with bluez 5.87, pairing hung in dual mode and completed with `ControllerMode = bredr`. use `bredr` only while pairing, then switch back to `dual` so case-open auto-connect works. dual mode connects normally on that card once paired, and the advert trigger was checked there.
 
 ## 🏗️ architecture
 
 <p align="center"><img src="docs/img/architecture.svg" alt="architecture" width="820"></p>
 
-the AirPods expose two links to every host. one is the audio profiles that bluez and pipewire already handle, the other is the AAP control channel on L2CAP PSM 0x1001. `aurisd` opens that control channel alongside the audio link, performs the Apple handshake, and subscribes to notifications. everything the CLI and the panel show comes from those notifications, never from inference about the audio stream.
+the AirPods give every host two links. bluez and pipewire handle the audio profiles, and `aurisd` opens the AAP control channel on L2CAP PSM 0x1001 beside them, completes the Apple handshake and subscribes to notifications. everything the CLI and the panel show comes from those notifications, never from guesses about the audio stream.
 
-the daemon is a set of small modules over one shared snapshot.
+| module | job |
+|---|---|
+| aap session | owns the L2CAP socket, handshake and subscription, and parses battery, ear, metadata and control echoes |
+| handoff | combines MPRIS playback edges with the AirPods' ownership messages to decide when to yield and when to claim |
+| autoconnect | matches the case's BLE advert, asks bluez to connect and reports the scan state in `state.json` |
+| rejoin | classifies a lost link from bluetooth events and reconnects when another host or a bud role switch caused it |
+| settings | writes a control, waits for the AirPods' report and marks the value confirmed or mismatched |
+| ear media | turns in-ear changes into pause and resume for local players |
+| store | folds every update into one snapshot, writes `state.json` atomically and pushes changes to socket subscribers |
 
-- **aap session** owns the L2CAP socket, the handshake, the notification subscription, and the parsing of battery, ear, metadata and control echoes.
-- **handoff** combines MPRIS playback edges with the accessory's ownership messages and decides when to yield and when to claim.
-- **autoconnect** matches the case's BLE proximity advertisement and asks bluez to connect. it reports the scan state in `state.json`, and waits for the adapter to change when LE is off or the adapter is unpowered.
-- **rejoin** classifies a lost link from bluetooth events and reconnects when the cause was another host or a bud role switch.
-- **settings** writes a control, waits for the accessory's report, and marks the value confirmed or mismatched.
-- **ear media** turns in-ear transitions into pause and resume commands for local players.
-- **store** folds every update into one snapshot, writes `state.json` atomically, and pushes changes to socket subscribers.
-
-clients hold no bluetooth code. they subscribe to the socket, read the state file, and send commands back over the same socket, so `auris status` and any frontend cannot disagree.
+clients hold no bluetooth code. they read the socket or the state file and send commands back over the socket, so `auris status` and the panel cannot disagree.
 
 ## 📚 documentation
 
-- [daemon, CLI and config](daemon/README.md) covers every command, flag, config key, the state file and the control socket.
-- [battery and handoff](docs/BATTERY_AND_HANDOFF.md) covers telemetry, freshness, the ownership protocol and the audio route.
-- [protocol evidence](docs/PROTOCOL_EVIDENCE.md) covers opcodes, control identifiers and what each report proves.
-- [feature comparison](docs/FEATURE_COMPARISON.md) is the annotated matrix.
-- [feature roadmap](docs/FEATURE_ROADMAP.md) covers what is implemented, what is blocked and why.
-- [mac agent and gestures](docs/MAC_AGENT_AND_GESTURES_RESEARCH.md) covers Apple-side limits, keychain boundaries and motion gestures.
-- [per-bud control](docs/PER_BUD_CONTROL_RESEARCH.md) covers what is known about single-bud controls.
+- [daemon readme](daemon/README.md) covers every command, flag, config key, the state file and the socket.
+- [battery and handoff](docs/BATTERY_AND_HANDOFF.md) covers telemetry, the ownership protocol, reconnects and the audio route.
+- [protocol evidence](docs/PROTOCOL_EVIDENCE.md) covers opcodes, control ids and what each report proves.
+- [features](docs/FEATURES.md) holds the annotated matrix and the status of every feature.
+- [research](docs/RESEARCH.md) covers per-bud control, a Mac-side helper, spatial audio and motion gestures.
 
 ## 📄 license
 

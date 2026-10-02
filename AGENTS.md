@@ -16,6 +16,7 @@ read this before changing anything in this repo, whichever agent you are. it hol
 this covers every markdown file (readme, changelog and docs). code blocks, inline code, URLs and literal values are exempt.
 
 - the readme opens with the title in a centred `h1` and the badge row straight after it, with nothing in between. one or two neutral paragraphs then say what the project is and what it does. no pitch and no opinion words such as best, cheap, robust or seamless.
+- only the root readme carries badges. every other markdown file (daemon readme, docs, tool readmes) has none.
 - badges are static shields.io badges with `style=flat-square&labelColor=1b1a20` in the repo colour. tech and platform badges come first and the license badge is always last, linked to `LICENSE` with `alt="license MIT"`. no stars or last-commit badges. a version on a badge is the version actually tested.
 - sections run in this order, skipping any that do not apply. highlights, install, usage, settings, requirements, troubleshooting, tests, layout or architecture, docs, license. headings are lowercase with one emoji.
 - highlights follow `- 🌙 **bold phrase** flows straight into the sentence.` and never `**label**: text`.
@@ -32,10 +33,11 @@ before committing a doc, `grep -nP '—|–| -- |;' <file>` should print nothing
 
 - `plugin.json` has `"requires_dms": ">=1.6.0"`. that was checked against the DMS v1.6.0 source (DankCommon, DankPopoutStandalone and the Theme properties auris uses), not by running auris on 1.6.
 - the release tag `v0.1.0` is on ef716ac. everything after it sits under the unreleased heading in CHANGELOG. tag the commit that gives that heading a version.
-- multi-host handoff, rename, in-ear pause and resume and auto-connect on case open are verified on AirPods 4 (ANC), the last three confirmed by the owner on 2026-10-01. microphone side and the listening-mode cycle stay unconfirmed. the readme, `docs/FEATURE_COMPARISON.md` and `docs/FEATURE_ROADMAP.md` must agree on every status.
-- case-open auto-connect needs LE on the adapter. with `ControllerMode = bredr` in bluez the advert scan cannot start and only the page fallback connects, and the daemon reports that as `autoconnect.scan` `le_disabled` in `state.json`. the readme, `daemon/README.md` and the two feature docs must say so together.
+- multi-host handoff, rename, in-ear pause and resume and auto-connect on case open are verified on AirPods 4 (ANC), the last three confirmed by the owner on 2026-10-01. microphone side and the listening-mode cycle stay unconfirmed. the readme and `docs/FEATURES.md` must agree on every status, and the feature matrix in both carries the same rows and notes.
+- case-open auto-connect needs LE on the adapter. with `ControllerMode = bredr` in bluez the advert scan cannot start and only the page fallback connects, and the daemon reports that as `autoconnect.scan` `le_disabled` in `state.json`. the readme, `daemon/README.md` and `docs/FEATURES.md` must say so together.
 - an earlier claim that auto-connect was captured working against a Mac was removed because nothing records it. add it back only with a capture.
 - LibrePods links point to `librepods-org/librepods`, and quoted LibrePods text keeps its original punctuation.
+- the docs were condensed on 2026-10-04. the feature comparison and roadmap merged into `docs/FEATURES.md`, and the per-bud and Mac agent research merged into `docs/RESEARCH.md`. `docs/BATTERY_AND_HANDOFF.md` keeps its name because code comments in `daemon/src` point to it.
 - research docs state findings as "the conclusion is that", never `conclusion:`.
 - the feature matrix legend is lowercase, and badges are rust and aap-l2cap, then the license, all in `8fd3ff`.
 - `AurisWidget.qml` dials the aurisd socket with a new `Socket` for every attempt. a quickshell 0.3.1 `Socket` never connects again after one failed attempt, so toggling `connected` on a single object loses the stream at the first daemon restart. keep the per-dial object.
