@@ -23,7 +23,7 @@ there is no kernel patch, no forked bluetooth stack, no root and no vendor daemo
 - 🔄 **multi-host handoff** yields to a Mac, iPhone or iPad on its ownership claim and takes the AirPods back on a local play edge, over the accessory's control channel, with both profiles left up.
 - 👂 **in-ear control** pauses local players when a bud comes out and resumes what auris paused when it goes back in, driven by the accessory's own in-ear reports.
 - 🩹 **a self-healing link** classifies evictions, primary-bud role switches and dropped links from bluetooth events, recovers each once, and never redials a disconnect you made yourself.
-- 📦 **auto-connect on case open** follows the case's BLE proximity advertisement, with a paging path for adapters that miss the advert.
+- 📦 **auto-connect on case open** follows the case's BLE proximity advertisement, which needs LE enabled on the adapter, with a paging path for adapters that miss the advert.
 - ✅ **verified settings** for noise control, conversational awareness, adaptive level, press speed, hold duration, call controls, personalized volume and rename are confirmed from the accessory's own report. microphone side and the listening-mode cycle are sent but carry no confirming report on this firmware.
 - 🧰 **a CLI and plain JSON**, with `auris` driving every control from a shell and `state.json` plus the control socket exposing the whole snapshot to other tools.
 - 🎛️ **a live panel** for DMS is an optional frontend for the same socket, pushed from the daemon rather than polled.
@@ -64,7 +64,7 @@ the annotated version is in [feature comparison](docs/FEATURE_COMPARISON.md).
 | Loud Sound Reduction | 🔴 | 🔴 | neither side has it on linux |
 | Head Gestures | ⛔ | ⛔ | no linux path, same reason LibrePods gives |
 | Conversational Awareness | ✅ | ✅ | control plus the 0x004B event |
-| Automatically connect to AirPods | ✅ | ✅ | pages over BLE on case opening, on by default |
+| Automatically connect to AirPods | ✅ | ✅ | pages over BLE on case opening, on by default, needs LE on the adapter |
 | Hearing Aid | 🔴 | 🔴 | neither side has it on linux |
 | Transparency Mode customization | 🔴 | 🔴 | adaptive strength only, not the full set |
 | Multi-device connectivity (Bluetooth Multipoint, 2 devices only) | ⚪ | ⚪ | two live hosts with ownership handoff, after an Apple `DeviceID` in bluez and one re-pair |
@@ -181,6 +181,7 @@ writes go out as AAP control commands and are judged by what comes back.
 ## ✅ requirements
 
 - linux with systemd user sessions, bluez 5 and pipewire.
+- an adapter with LE enabled, for auto-connect on case open. bluez with `ControllerMode = bredr` turns LE off and leaves only the page fallback.
 - rust 1.85 or newer to build.
 - DMS 1.6 or newer, for the optional panel.
 
@@ -192,6 +193,8 @@ if the AirPods are connected but nothing reports, give the daemon a few seconds 
 
 if handoff does nothing, confirm the `DeviceID` line is in `/etc/bluetooth/main.conf` and that the AirPods were paired again after it was added. without it the AirPods will not exchange ownership with this host.
 
+if the AirPods do not connect when the case opens, run `auris status`. a last line saying bluetooth LE is off on the adapter means bluez runs with `ControllerMode = bredr` in `/etc/bluetooth/main.conf`, so the advert scan cannot start. set `ControllerMode = dual` (or remove the line) and run `sudo systemctl restart bluetooth`. aurisd notices the adapter coming back and starts the scan without a restart of its own. while LE is off, only the page fallback connects, and only in the first 10min after a drop.
+
 ## 🏗️ architecture
 
 <p align="center"><img src="docs/img/architecture.svg" alt="architecture" width="820"></p>
@@ -202,7 +205,7 @@ the daemon is a set of small modules over one shared snapshot.
 
 - **aap session** owns the L2CAP socket, the handshake, the notification subscription, and the parsing of battery, ear, metadata and control echoes.
 - **handoff** combines MPRIS playback edges with the accessory's ownership messages and decides when to yield and when to claim.
-- **autoconnect** matches the case's BLE proximity advertisement and asks bluez to connect.
+- **autoconnect** matches the case's BLE proximity advertisement and asks bluez to connect. it reports the scan state in `state.json`, and waits for the adapter to change when LE is off or the adapter is unpowered.
 - **rejoin** classifies a lost link from bluetooth events and reconnects when the cause was another host or a bud role switch.
 - **settings** writes a control, waits for the accessory's report, and marks the value confirmed or mismatched.
 - **ear media** turns in-ear transitions into pause and resume commands for local players.

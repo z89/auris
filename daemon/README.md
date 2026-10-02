@@ -52,6 +52,9 @@ every `auris` subcommand accepts the global options below.
 shows the current state. `--json` prints the raw `state.json` object instead
 of a summary.
 
+when the advert scan cannot run (`autoconnect.scan` is `le_disabled`,
+`adapter_off` or `failed`), the summary ends with one line saying why.
+
 ```sh
 auris status
 auris status --json
@@ -270,7 +273,7 @@ auto_resume = true           # resume the player auris paused, once the bud is b
 pause_on_one_of_two = true   # pause as soon as one of two in-ear buds leaves, not just the last one
 
 [autoconnect]
-enabled = true                    # page the AirPods when their BLE proximity advert appears
+enabled = true                    # page the AirPods when their BLE proximity advert appears (needs LE on the adapter)
 min_rssi = -90                    # ignore adverts weaker than this, in dbm
 settle_seconds = 3                # wait this long after the first advert before paging
 absence_seconds = 15              # silence at least this long ends a presence episode
@@ -341,6 +344,15 @@ pages the AirPods when their BLE proximity advert appears. bluez never pages
 a classic device on its own, so a host only gets the AirPods when they happen
 to page it. a Mac listening for the same advert wins that race otherwise.
 
+the advert scan needs LE on the adapter. with `ControllerMode = bredr` in
+`/etc/bluetooth/main.conf` the scan can never start, so aurisd logs one
+warning and waits for the adapter to change, since bluez reads
+`ControllerMode` only at start. it rechecks every 5min in case it missed
+that. an unpowered or missing adapter is waited on the same way, and any
+other scan error is retried with a wait that grows from 5s to 5min. the page
+fallback keeps working throughout, for its first 10min after a drop. the
+current state is `autoconnect.scan` in `state.json`.
+
 | key | default | effect |
 |---|---|---|
 | `enabled` | `true` | scan for the advert and page once per presence episode |
@@ -408,7 +420,8 @@ example.
   "settings_status": { "press_speed": "confirmed" },
   "settings_verify": "idle",
   "verify_reopen": false,
-  "link": { "status": "reconnecting", "reason": "bud_switch", "attempt": 1, "since": "2026-09-16T02:01:47Z" }
+  "link": { "status": "reconnecting", "reason": "bud_switch", "attempt": 1, "since": "2026-09-16T02:01:47Z" },
+  "autoconnect": { "scan": "idle" }
 }
 ```
 
@@ -484,6 +497,22 @@ device on screen instead of dropping it for the six seconds a rejoin takes.
 - `link.since` is when the sequence started, RFC3339 in UTC with a `Z`. it is
   `null` when there is no sequence.
 - both reset when the link comes back.
+
+#### autoconnect
+
+`autoconnect.scan` says whether the advert scan behind auto-connect on case
+open can run. the object is additive, so older readers can ignore it.
+
+| value | meaning |
+|---|---|
+| `idle` | no scan is running and the last one found nothing wrong, for example because the AirPods are connected or `enabled = false` |
+| `scanning` | the LE discovery scan is running |
+| `le_disabled` | LE is off on the adapter, usually `ControllerMode = bredr`. aurisd waits for the adapter to change and rechecks every 5min |
+| `adapter_off` | the adapter is unpowered or missing. aurisd waits for it to return |
+| `failed` | the scan failed for another reason. aurisd retries with a wait that grows from 5s to 5min |
+
+a fault stays in place until the next scan runs. `auris status` adds a line
+for `le_disabled`, `adapter_off` and `failed`.
 
 #### settings
 

@@ -2,6 +2,20 @@
 
 ## unreleased, AirPods 4 ANC settings
 
+- auto-connect now handles an adapter with LE off. with `ControllerMode =
+  bredr` in bluez the advert scan can never start, so the daemon logs one
+  warning where it used to retry every 5s, waits for the adapter to change
+  (bluez reads `ControllerMode` only at start) and rechecks every 5min. an
+  unpowered or missing adapter is waited on, and any other scan error is
+  retried with a wait that grows from 5s to 5min. `state.json` gains an
+  additive `autoconnect.scan` (`idle`, `scanning`, `le_disabled`,
+  `adapter_off` or `failed`), and `auris status` adds a line for the last
+  three. the page fallback still covers the first 10min after a drop.
+- the bar widget gets its live stream back after a daemon restart. every
+  dial now uses a new socket, because a quickshell socket never connects
+  again after one failed attempt, and the first redial after a restart
+  always failed. the `state.json` polling fallback runs every 1s, down from
+  3s.
 - in-ear media control (`[ear]`, on by default) means a bud leaving an ear
   pauses local MPRIS players, and a bud returning resumes the player auris
   paused. the default pauses as soon as one of two in-ear buds leaves,
