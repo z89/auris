@@ -1415,7 +1415,7 @@ PluginComponent {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: root.showPercent && root.pillLevel >= 0
                 text: root.pillText
-                font.pixelSize: Theme.fontSizeSmall
+                font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
                 color: root.pillColor
             }
         }
@@ -1445,7 +1445,7 @@ PluginComponent {
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: root.showPercent && root.pillLevel >= 0
                 text: String(root.pillLevel)
-                font.pixelSize: Theme.fontSizeSmall
+                font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
                 color: root.pillColor
             }
         }
