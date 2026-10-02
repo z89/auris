@@ -38,7 +38,7 @@ confirm the setting took effect.
 | Loud Sound Reduction | 🔴 | 🔴 | neither side has it on linux |
 | Head Gestures | ⛔ | ⛔ | no linux path, same reason LibrePods gives |
 | Conversational Awareness | ✅ | ✅ | control plus the 0x004B event |
-| Automatically connect to AirPods | ✅ | ✅ | auris pages over BLE on case opening, on by default |
+| Automatically connect to AirPods | ✅ | ✅ | auris pages over BLE on case opening, on by default, needs LE on the adapter |
 | Hearing Aid | 🔴 | 🔴 | neither side has it on linux |
 | Transparency Mode customization | 🔴 | 🔴 | auris has adaptive strength only, not the full set |
 | Multi-device connectivity (Bluetooth Multipoint; 2 devices only) | ⚪ | ⚪ | auris runs two live hosts with ownership handoff, after an Apple `DeviceID` in bluez and one re-pair |

@@ -33,6 +33,7 @@ before committing a doc, `grep -nP '—|–| -- |;' <file>` should print nothing
 - `plugin.json` has `"requires_dms": ">=1.6.0"`. that was checked against the DMS v1.6.0 source (DankCommon, DankPopoutStandalone and the Theme properties auris uses), not by running auris on 1.6.
 - the release tag `v0.1.0` is on ef716ac. everything after it sits under the unreleased heading in CHANGELOG. tag the commit that gives that heading a version.
 - multi-host handoff, rename, in-ear pause and resume and auto-connect on case open are verified on AirPods 4 (ANC), the last three confirmed by the owner on 2026-10-01. microphone side and the listening-mode cycle stay unconfirmed. the readme, `docs/FEATURE_COMPARISON.md` and `docs/FEATURE_ROADMAP.md` must agree on every status.
+- case-open auto-connect needs LE on the adapter. with `ControllerMode = bredr` in bluez the advert scan cannot start and only the page fallback connects, and the daemon reports that as `autoconnect.scan` `le_disabled` in `state.json`. the readme, `daemon/README.md` and the two feature docs must say so together.
 - an earlier claim that auto-connect was captured working against a Mac was removed because nothing records it. add it back only with a capture.
 - LibrePods links point to `librepods-org/librepods`, and quoted LibrePods text keeps its original punctuation.
 - research docs state findings as "the conclusion is that", never `conclusion:`.

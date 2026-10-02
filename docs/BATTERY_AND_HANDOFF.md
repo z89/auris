@@ -443,6 +443,11 @@ discovery is LE only, with `duplicate_data` on and `discoverable` off. it runs
 only while the AirPods are not connected locally. a local connection stops it,
 and a disconnect starts it again.
 
+the scan needs LE on the adapter. with `ControllerMode = bredr` in bluez it
+cannot start, so the daemon logs one warning, waits for the adapter to change
+and rechecks every 5min, and reports `autoconnect.scan` as `le_disabled` in
+`state.json`.
+
 an advert qualifies when all of these hold.
 
 - Apple's company id `0x004C` carries proximity-pairing type `0x07`.
@@ -482,8 +487,9 @@ three things disarm the trigger, each logged with its reason.
 ### page fallback when no advert arrives
 
 the advert trigger is not reliable on every adapter. some dongles produce no
-qualifying advert for a whole case cycle, and nothing pages. this host therefore
-pages on a slow cadence when all of these hold.
+qualifying advert for a whole case cycle, and nothing pages. an adapter with LE
+off sees no advert at all, so for it this fallback is the only trigger. this
+host therefore pages on a slow cadence when all of these hold.
 
 - the AirPods are disconnected locally.
 - the machine is still armed, with no connect command and no `Local` disconnect since
