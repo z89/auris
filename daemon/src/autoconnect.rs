@@ -29,6 +29,14 @@
 //! rejoin or another page is in flight, so the advert path keeps priority
 //! and there is still only one page at a time.
 //!
+//! The scan itself can also be impossible. BlueZ started with
+//! `ControllerMode = bredr` runs the adapter without LE and answers every LE
+//! discovery with `InProgress`, and an adapter can be missing or powered off.
+//! [`run`] tells these apart, publishes the result as the snapshot's
+//! `autoconnect.scan`, says so once, and waits for the adapter to change
+//! instead of retrying on a short timer. Until then only the page fallback
+//! connects.
+//!
 //! The decision logic in [`decide`] is pure; the scanner in [`run`] only
 //! reports sightings and the supervisor in `aap::session` owns every connect,
 //! which is also where `rejoin` lives. Only one place ever pages the device.
@@ -40,16 +48,21 @@ use std::{
 };
 
 use bluer::{
-    AdapterEvent, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
+    AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, DiscoveryFilter,
+    DiscoveryTransport,
 };
-use futures_util::{stream::SelectAll, StreamExt};
+use futures_util::{
+    stream::{self, SelectAll},
+    StreamExt,
+};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
     config::AutoconnectConfig,
     rejoin::{Outcome, Reason},
-    store::Store,
+    state::ScanHealth,
+    store::{Store, Update},
 };
 
 /// Waits before the second, third and fourth connect of an episode.
@@ -77,8 +90,96 @@ pub const DEFAULT_MODEL_ID: u16 = 0x201b;
 /// subscriptions. Removed devices give their slot back.
 pub const WATCHED_CAP: usize = 64;
 
-/// Sleep after a failed scan setup, so a missing adapter cannot spin.
+/// Sleep after the first failed scan setup, so a failing one cannot spin. It
+/// doubles with every further failure in a row.
 const SCAN_RETRY: Duration = Duration::from_secs(5);
+
+/// Longest wait between scan setups that keep failing.
+const SCAN_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Recheck interval while BlueZ runs the adapter without LE. BlueZ reads
+/// `ControllerMode` only when it starts, so the adapter reappearing is the
+/// real wake-up and this only covers a missed event.
+const LE_RECHECK: Duration = Duration::from_secs(300);
+
+/// Recheck interval while there is no powered adapter. Its return is an
+/// event too; this only covers a missed one.
+const ADAPTER_RECHECK: Duration = Duration::from_secs(60);
+
+/// Wait after an adapter event before scanning again, so bluetoothd has
+/// finished registering the adapter's interfaces.
+const ADAPTER_SETTLE: Duration = Duration::from_secs(2);
+
+/// Why the proximity scan could not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFault {
+    /// BlueZ runs the adapter without LE, so no advert can ever be seen.
+    LeDisabled,
+    /// No adapter, or it is powered off.
+    AdapterOff,
+    /// Anything else. Retried with a growing wait.
+    Other,
+}
+
+impl ScanFault {
+    /// The value published as the snapshot's `autoconnect.scan`.
+    pub fn health(self) -> ScanHealth {
+        match self {
+            Self::LeDisabled => ScanHealth::LeDisabled,
+            Self::AdapterOff => ScanHealth::AdapterOff,
+            Self::Other => ScanHealth::Failed,
+        }
+    }
+}
+
+/// Classify a failed scan setup from the BlueZ error it ended with.
+///
+/// `le_manager` says whether the adapter exposes `LEAdvertisingManager1`,
+/// which BlueZ registers only when it runs the controller with LE:
+/// `Some(false)` means the interface is missing, `None` that the adapter was
+/// not asked. The kernel rejects an LE discovery on a BR/EDR-only adapter and
+/// BlueZ passes every such rejection on as `InProgress`, which names no
+/// cause, so the missing interface is what identifies the case.
+pub fn classify(kind: Option<&bluer::ErrorKind>, le_manager: Option<bool>) -> ScanFault {
+    match kind {
+        Some(bluer::ErrorKind::NotReady | bluer::ErrorKind::NotFound) => ScanFault::AdapterOff,
+        // Not an answer from BlueZ: the bus, or bluetoothd itself, is away.
+        Some(bluer::ErrorKind::Internal(_)) | None => ScanFault::Other,
+        Some(_) if le_manager == Some(false) => ScanFault::LeDisabled,
+        Some(_) => ScanFault::Other,
+    }
+}
+
+/// D-Bus error names an object answers with when it has no such interface or
+/// property. BlueZ uses `InvalidArgs`; the other two are the names the D-Bus
+/// specification gives the same condition.
+pub fn interface_missing(dbus_error: &str) -> bool {
+    matches!(
+        dbus_error,
+        "org.freedesktop.DBus.Error.InvalidArgs"
+            | "org.freedesktop.DBus.Error.UnknownInterface"
+            | "org.freedesktop.DBus.Error.UnknownProperty"
+    )
+}
+
+/// Wait before retrying a scan setup that has failed `failures` times in a
+/// row: [`SCAN_RETRY`] doubled per further failure, at most
+/// [`SCAN_RETRY_MAX`].
+pub fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    SCAN_RETRY
+        .saturating_mul(1 << doublings)
+        .min(SCAN_RETRY_MAX)
+}
+
+/// What the scan loop remembers between attempts. Reset by a scan that runs.
+#[derive(Debug, Default)]
+struct Retry {
+    /// Scan setups that failed in a row.
+    failures: u32,
+    /// The last fault, so the same one is announced once and not per attempt.
+    fault: Option<ScanFault>,
+}
 
 /// One qualifying advert, as the scanner saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +651,10 @@ fn describe(outcome: &Outcome) -> String {
 
 /// Run LE discovery whenever the supervisor asks for it, reporting qualifying
 /// adverts on `seen_tx`. Never scans while the feature is off.
+///
+/// A scan that cannot start is not retried blindly: the cause is classified,
+/// published as the snapshot's `autoconnect.scan`, announced once, and then
+/// waited out in [`park`] until something that could change it happens.
 pub async fn run(
     store: Arc<Store>,
     config: AutoconnectConfig,
@@ -563,6 +668,7 @@ pub async fn run(
         );
         return;
     }
+    let mut retry = Retry::default();
     loop {
         if !*scan_rx.borrow_and_update() {
             if scan_rx.changed().await.is_err() {
@@ -570,21 +676,162 @@ pub async fn run(
             }
             continue;
         }
-        if let Err(e) = scan(&store, &config, &seen_tx, &mut scan_rx).await {
-            warn!(target: "aurisd::autoconnect", error = %e, "proximity scan failed");
-            tokio::time::sleep(SCAN_RETRY).await;
+        let (session, result) = match bluer::Session::new().await {
+            Ok(session) => {
+                let result = scan(
+                    &session,
+                    &store,
+                    &config,
+                    &seen_tx,
+                    &mut scan_rx,
+                    &mut retry,
+                )
+                .await;
+                (Some(session), result)
+            }
+            Err(e) => (None, Err(e.into())),
+        };
+        let error = match result {
+            Ok(()) => {
+                store.apply(Update::ScanHealth(ScanHealth::Idle));
+                // Still wanted, so the discovery stream ended under the
+                // scan: bluetoothd went away. Do not spin on its absence.
+                if *scan_rx.borrow() {
+                    tokio::time::sleep(SCAN_RETRY).await;
+                }
+                continue;
+            }
+            Err(e) => e,
+        };
+        let fault = match &session {
+            Some(session) => diagnose(session, &error).await,
+            None => ScanFault::Other,
+        };
+        let repeat = retry.fault == Some(fault);
+        retry.fault = Some(fault);
+        retry.failures += 1;
+        store.apply(Update::ScanHealth(fault.health()));
+        announce(fault, repeat, &error, retry.failures);
+        let limit = match fault {
+            ScanFault::LeDisabled => LE_RECHECK,
+            ScanFault::AdapterOff => ADAPTER_RECHECK,
+            ScanFault::Other => retry_delay(retry.failures),
+        };
+        if !park(session.as_ref(), limit, &mut scan_rx).await {
+            return;
         }
     }
 }
 
+/// Classify a failed scan, asking the adapter about LE only when the answer
+/// could change the verdict.
+async fn diagnose(session: &bluer::Session, error: &anyhow::Error) -> ScanFault {
+    let kind = error.downcast_ref::<bluer::Error>().map(|e| &e.kind);
+    if classify(kind, Some(false)) != ScanFault::LeDisabled {
+        return classify(kind, None);
+    }
+    let le_manager = match session.default_adapter().await {
+        Ok(adapter) => le_manager_present(&adapter).await,
+        Err(_) => None,
+    };
+    classify(kind, le_manager)
+}
+
+/// Does the adapter expose `LEAdvertisingManager1`? `None` when the question
+/// could not be put to it.
+async fn le_manager_present(adapter: &bluer::Adapter) -> Option<bool> {
+    match adapter.supported_advertising_instances().await {
+        Ok(_) => Some(true),
+        Err(bluer::Error {
+            kind: bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(name)),
+            ..
+        }) if interface_missing(&name) => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Say why the scan is not running: once per fault, and at debug level for
+/// every further attempt that ends the same way.
+fn announce(fault: ScanFault, repeat: bool, error: &anyhow::Error, failures: u32) {
+    if repeat {
+        debug!(
+            target: "aurisd::autoconnect",
+            error = %error,
+            ?fault,
+            failures,
+            "proximity scan still unavailable"
+        );
+        return;
+    }
+    match fault {
+        ScanFault::LeDisabled => warn!(
+            target: "aurisd::autoconnect",
+            "Bluetooth LE is off on the adapter, so the proximity advert cannot be seen and \
+             only the page fallback connects; set ControllerMode = dual in \
+             /etc/bluetooth/main.conf and restart bluetooth"
+        ),
+        ScanFault::AdapterOff => info!(
+            target: "aurisd::autoconnect",
+            error = %error,
+            "no powered Bluetooth adapter; the proximity scan waits for one"
+        ),
+        ScanFault::Other => warn!(
+            target: "aurisd::autoconnect",
+            error = %error,
+            "proximity scan failed"
+        ),
+    }
+}
+
+/// Wait until another scan attempt is worth making: an adapter came or went,
+/// the adapter's power changed, the supervisor changed its mind, or `limit`
+/// passed. Returns `false` once the supervisor is gone.
+async fn park(
+    session: Option<&bluer::Session>,
+    limit: Duration,
+    scan_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut adapters = stream::pending::<()>().boxed();
+    let mut power = stream::pending::<()>().boxed();
+    if let Some(session) = session {
+        if let Ok(events) = session.events().await {
+            adapters = events.map(|_| ()).boxed();
+        }
+        if let Ok(adapter) = session.default_adapter().await {
+            if let Ok(events) = adapter.events().await {
+                power = events
+                    .filter_map(|event| async move {
+                        matches!(
+                            event,
+                            AdapterEvent::PropertyChanged(AdapterProperty::Powered(_))
+                        )
+                        .then_some(())
+                    })
+                    .boxed();
+            }
+        }
+    }
+    let adapter_changed = tokio::select! {
+        _ = tokio::time::sleep(limit) => false,
+        wish = scan_rx.changed() => return wish.is_ok(),
+        Some(()) = adapters.next() => true,
+        Some(()) = power.next() => true,
+    };
+    if adapter_changed {
+        tokio::time::sleep(ADAPTER_SETTLE).await;
+    }
+    true
+}
+
 async fn scan(
+    session: &bluer::Session,
     store: &Store,
     config: &AutoconnectConfig,
     seen_tx: &mpsc::Sender<Sighting>,
     scan_rx: &mut watch::Receiver<bool>,
+    retry: &mut Retry,
 ) -> anyhow::Result<()> {
     let model = model_bytes(&store.snapshot().device.model_id);
-    let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     adapter
         .set_discovery_filter(DiscoveryFilter {
@@ -596,6 +843,9 @@ async fn scan(
         .await?;
     let discovery = adapter.discover_devices().await?;
     tokio::pin!(discovery);
+    // The scan runs, so whatever stopped the last one is over.
+    *retry = Retry::default();
+    store.apply(Update::ScanHealth(ScanHealth::Scanning));
     info!(
         target: "aurisd::autoconnect",
         model = %format!("{:02X}{:02X}", model[1], model[0]),
@@ -1237,5 +1487,70 @@ mod tests {
         seen(&mut s, t0 + Duration::from_secs(5));
         connect_at(&mut s, t0 + Duration::from_secs(10));
         assert_eq!(s.pending_attempt(), 2);
+    }
+
+    #[test]
+    fn an_le_discovery_refused_without_the_le_manager_means_le_is_off() {
+        use bluer::ErrorKind;
+        // BlueZ's answer on a BR/EDR-only adapter, with the interface gone.
+        assert_eq!(
+            classify(Some(&ErrorKind::InProgress), Some(false)),
+            ScanFault::LeDisabled
+        );
+        // The verdict rests on the interface, not on one error name.
+        assert_eq!(
+            classify(Some(&ErrorKind::Failed), Some(false)),
+            ScanFault::LeDisabled
+        );
+        // The same refusal with LE present, or unasked, is an ordinary failure.
+        assert_eq!(
+            classify(Some(&ErrorKind::InProgress), Some(true)),
+            ScanFault::Other
+        );
+        assert_eq!(
+            classify(Some(&ErrorKind::InProgress), None),
+            ScanFault::Other
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unpowered_adapter_is_not_mistaken_for_le_off() {
+        use bluer::{ErrorKind, InternalErrorKind};
+        for kind in [ErrorKind::NotReady, ErrorKind::NotFound] {
+            assert_eq!(classify(Some(&kind), Some(false)), ScanFault::AdapterOff);
+        }
+        // bluetoothd away: not a BlueZ answer, so nothing is concluded from it.
+        let no_owner = ErrorKind::Internal(InternalErrorKind::DBus(
+            "org.freedesktop.DBus.Error.NameHasNoOwner".to_owned(),
+        ));
+        assert_eq!(classify(Some(&no_owner), Some(false)), ScanFault::Other);
+        assert_eq!(classify(None, Some(false)), ScanFault::Other);
+    }
+
+    #[test]
+    fn only_a_missing_interface_counts_as_no_le_manager() {
+        assert!(interface_missing("org.freedesktop.DBus.Error.InvalidArgs"));
+        assert!(interface_missing(
+            "org.freedesktop.DBus.Error.UnknownInterface"
+        ));
+        assert!(!interface_missing(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ));
+        assert!(!interface_missing("org.freedesktop.DBus.Error.NoReply"));
+    }
+
+    #[test]
+    fn a_failing_scan_setup_is_retried_ever_more_slowly() {
+        let waits: Vec<u64> = (1..=8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(retry_delay(0), SCAN_RETRY);
+        assert_eq!(retry_delay(u32::MAX), SCAN_RETRY_MAX);
+    }
+
+    #[test]
+    fn every_fault_is_published_under_its_own_name() {
+        assert_eq!(ScanFault::LeDisabled.health(), ScanHealth::LeDisabled);
+        assert_eq!(ScanFault::AdapterOff.health(), ScanHealth::AdapterOff);
+        assert_eq!(ScanFault::Other.health(), ScanHealth::Failed);
     }
 }
